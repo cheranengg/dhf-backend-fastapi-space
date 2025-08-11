@@ -1,11 +1,20 @@
-fastapi
-uvicorn[standard]
+# --- API stack (FastAPI v1 pydantic) ---
+fastapi==0.95.2
+uvicorn[standard]>=0.22.0
 pydantic<2
-transformers>=4.40
-accelerate
-peft
-bitsandbytes
-torch --extra-index-url https://download.pytorch.org/whl/cu121
-huggingface_hub
-pandas
-openpyxl
+
+# --- Core ML stack ---
+transformers>=4.41.0
+accelerate>=0.30.0
+peft>=0.11.0
+# torch comes from the base image (PyTorch 2.3.1 + CUDA 12.1)
+
+# --- Optional/used features ---
+bitsandbytes>=0.43.1
+sentence-transformers>=2.6.1
+faiss-cpu>=1.8.0.post1
+huggingface_hub>=0.23.0
+
+# --- Utilities ---
+pandas>=2.2.0
+openpyxl>=3.1.2
