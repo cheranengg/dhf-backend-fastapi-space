@@ -1,0 +1,114 @@
+# app/utils/io_schemas.py
+# ------------------------
+# Pydantic schemas for DHF Automation I/O
+# Used in FastAPI routes for validation + OpenAPI docs
+
+from __future__ import annotations
+from typing import List, Optional, Any, Dict
+from pydantic import BaseModel, Field
+
+# -----------------------------
+# Generic
+# -----------------------------
+class RequirementInput(BaseModel):
+    """Single product requirement."""
+    requirement_id: Optional[str] = Field(None, description="Unique requirement identifier")
+    requirements: str = Field(..., description="Text of the product requirement")
+
+
+class BatchRequirementsInput(BaseModel):
+    """Batch of product requirements."""
+    requirements: List[RequirementInput] = Field(..., description="List of requirements to process")
+
+
+# -----------------------------
+# Hazard Analysis (HA)
+# -----------------------------
+class HazardAnalysisRow(BaseModel):
+    risk_id: str = Field(..., description="Risk ID from hazard analysis (e.g., HA-001)")
+    hazard: str
+    hazardous_situation: str
+    risk_to_health: str
+    harm: str
+    sequence_of_events: str
+    severity_of_harm: str
+    p0: Optional[str]
+    p1: Optional[str]
+    poh: Optional[str]
+    risk_index: Optional[str]
+    risk_control: Optional[str]
+    requirement_id: Optional[str]
+
+
+class HazardAnalysisOutput(BaseModel):
+    # NOTE: matches main.py response key {"ha": [...]}
+    ha: List[HazardAnalysisRow]
+
+
+# -----------------------------
+# Design Verification Protocol (DVP)
+# -----------------------------
+class DvpRow(BaseModel):
+    verification_id: str
+    requirement_id: Optional[str]
+    requirements: Optional[str]
+    verification_method: str
+    sample_size: Optional[int]
+    acceptance_criteria: str
+    test_procedure: Optional[str]
+
+
+class DvpOutput(BaseModel):
+    # NOTE: matches main.py response key {"dvp": [...]}
+    dvp: List[DvpRow]
+
+
+# -----------------------------
+# Trace Matrix (TM)
+# -----------------------------
+class TraceMatrixRow(BaseModel):
+    verification_id: str
+    requirement_id: str
+    requirements: str
+    risk_ids: str
+    risks_to_health: str
+    ha_risk_controls: str
+    verification_method: str
+    acceptance_criteria: str
+
+
+class TraceMatrixOutput(BaseModel):
+    # NOTE: matches main.py response key {"trace_matrix": [...]}
+    trace_matrix: List[TraceMatrixRow]
+
+
+# -----------------------------
+# API Responses
+# -----------------------------
+class HealthResponse(BaseModel):
+    status: str = "ok"
+
+
+class ErrorResponse(BaseModel):
+    error: str
+
+
+class GuardrailIssue(BaseModel):
+    row_index: int
+    column: str
+    issue: str
+    suggestion: Optional[str] = None
+
+
+class GuardrailResult(BaseModel):
+    ok: bool
+    issues: List[GuardrailIssue]
+
+
+# -----------------------------
+# For file-based input (Excel)
+# -----------------------------
+class ExcelUploadResponse(BaseModel):
+    filename: str
+    rows_processed: int
+    data_preview: Optional[List[Dict[str, Any]]]
