@@ -1,0 +1,43 @@
+
+---
+
+## **.dockerignore**
+
+```dockerignore
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environments
+.venv/
+env/
+venv/
+
+# Ignore build artifacts
+build/
+dist/
+*.egg-info
+
+# Ignore local configs & secrets
+config.toml
+secrets.toml
+.env
+
+# Ignore notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Ignore local models not stored in repo
+models/*
+!models/.gitkeep
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore Git & HF metadata (except LFS pointers)
+.git
+.gitignore
+.gitattributes
