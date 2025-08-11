@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic<2
+transformers>=4.40
+accelerate
+peft
+bitsandbytes
+torch --extra-index-url https://download.pytorch.org/whl/cu121
+huggingface_hub
+pandas
+openpyxl
