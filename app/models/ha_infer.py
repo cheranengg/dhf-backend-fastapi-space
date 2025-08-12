@@ -9,7 +9,7 @@ HA_MODEL_MERGED_DIR = os.getenv("HA_MODEL_MERGED_DIR", "/models/mistral_finetune
 BASE_MODEL_ID = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")  # not used if merged
 LORA_HA_DIR = os.getenv("LORA_HA_DIR", "/models/mistral_finetuned_Hazard_Analysis")  # legacy path
 HF_TOKEN = os.getenv("HF_TOKEN")  # optional for private repos
-
+HF_HOME = os.getenv("HF_HOME")
 # ---------------- Optional embedding for “nearest control” ----------------
 try:
     from sentence_transformers import SentenceTransformer
@@ -118,13 +118,13 @@ def _load_model():
 
     # Prefer merged directory / repo id
     model_id = HA_MODEL_MERGED_DIR
-    token_kw = {"use_auth_token": HF_TOKEN} if HF_TOKEN else {}
+    token_kw = {"token": HF_TOKEN} if HF_TOKEN else {}
 
     try:
-        _tokenizer = AutoTokenizer.from_pretrained(model_id, **token_kw)  # type: ignore
+        _tokenizer = AutoTokenizer.from_pretrained(model_id, **token_kw, cache_dir=HF_HOME)  # type: ignore
         if _tokenizer.pad_token is None:
             _tokenizer.pad_token = _tokenizer.eos_token  # type: ignore
-        _model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE, **token_kw)  # type: ignore
+        _model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE, **token_kw, cache_dir=HF_HOME)  # type: ignore
     except Exception:
         # (Legacy) base + LoRA path if someone didn’t provide a merged repo
         if LORA_HA_DIR and PeftModel:
