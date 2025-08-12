@@ -119,12 +119,13 @@ def _load_model():
     # Prefer merged directory / repo id
     model_id = HA_MODEL_MERGED_DIR
     token_kw = {"token": HF_TOKEN} if HF_TOKEN else {}
+    cache_kw = {"cache_dir": HF_HOME} if HF_HOME else {}
 
     try:
-        _tokenizer = AutoTokenizer.from_pretrained(model_id, **token_kw, cache_dir=HF_HOME)  # type: ignore
+        _tokenizer = AutoTokenizer.from_pretrained(model_id, **token_kw, **cache_kw)  # type: ignore
         if _tokenizer.pad_token is None:
             _tokenizer.pad_token = _tokenizer.eos_token  # type: ignore
-        _model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE, **token_kw, cache_dir=HF_HOME)  # type: ignore
+        _model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE, **token_kw, **cache_kw)  # type: ignore
     except Exception:
         # (Legacy) base + LoRA path if someone didn’t provide a merged repo
         if LORA_HA_DIR and PeftModel:
