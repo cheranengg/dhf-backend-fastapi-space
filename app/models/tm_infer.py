@@ -76,12 +76,14 @@ def _load_tm_model():
     if not USE_TM_MODEL or _model is not None:
         return
     token_kw = {"token": HF_TOKEN} if HF_TOKEN else {}
+    cache_kw = {"cache_dir": HF_HOME} if HF_HOME else {}
+    
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
-    _tokenizer = AutoTokenizer.from_pretrained(TM_MODEL_DIR, **token_kw, cache_dir=HF_HOME)  # type: ignore
+    _tokenizer = AutoTokenizer.from_pretrained(TM_MODEL_DIR, **token_kw, **cache_kw)  # type: ignore
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token  # type: ignore
-    _model = AutoModelForCausalLM.from_pretrained(TM_MODEL_DIR, torch_dtype=DTYPE, **token_kw, cache_dir=HF_HOME)  # type: ignore
+    _model = AutoModelForCausalLM.from_pretrained(TM_MODEL_DIR, torch_dtype=DTYPE, **token_kw, **cache_kw)  # type: ignore
     _model.to(DEVICE)  # type: ignore
 
 # ---------------- Public API ----------------
