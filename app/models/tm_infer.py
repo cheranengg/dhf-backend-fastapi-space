@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional
 USE_TM_MODEL = os.getenv("USE_TM_MODEL", "0") == "1"
 TM_MODEL_DIR = os.getenv("TM_MODEL_DIR", "/models/mistral_finetuned_Trace_Matrix")
 HF_TOKEN = os.getenv("HF_TOKEN")
-
+HF_HOME = os.getenv("HF_HOME")
 if USE_TM_MODEL:
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -75,13 +75,13 @@ def _load_tm_model():
     global _tokenizer, _model
     if not USE_TM_MODEL or _model is not None:
         return
-    token_kw = {"use_auth_token": HF_TOKEN} if HF_TOKEN else {}
+    token_kw = {"token": HF_TOKEN} if HF_TOKEN else {}
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
-    _tokenizer = AutoTokenizer.from_pretrained(TM_MODEL_DIR, **token_kw)  # type: ignore
+    _tokenizer = AutoTokenizer.from_pretrained(TM_MODEL_DIR, **token_kw, cache_dir=HF_HOME)  # type: ignore
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token  # type: ignore
-    _model = AutoModelForCausalLM.from_pretrained(TM_MODEL_DIR, torch_dtype=DTYPE, **token_kw)  # type: ignore
+    _model = AutoModelForCausalLM.from_pretrained(TM_MODEL_DIR, torch_dtype=DTYPE, **token_kw, cache_dir=HF_HOME)  # type: ignore
     _model.to(DEVICE)  # type: ignore
 
 # ---------------- Public API ----------------
