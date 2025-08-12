@@ -1,21 +1,38 @@
-# app/main.py
 from __future__ import annotations
 
-# --- ensure HF cache dir is writable and exists ---
+# ---------------- HF cache bootstrap (must come first) ----------------
 import os
+
+# Honor any user-provided cache env first
 cache_dir = (
     os.environ.get("HF_HOME")
     or os.environ.get("HF_HUB_CACHE")
     or os.environ.get("HUGGINGFACE_HUB_CACHE")
     or os.environ.get("TRANSFORMERS_CACHE")
-    or "/data/.cache/hf"        # on HF Spaces, /data is writable
 )
-os.environ.setdefault("HF_HOME", cache_dir)
-os.environ.setdefault("HF_HUB_CACHE", cache_dir)
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", cache_dir)
-os.environ.setdefault("TRANSFORMERS_CACHE", cache_dir)
-os.makedirs(cache_dir, exist_ok=True)
 
+# If none set, choose the first writable candidate
+if not cache_dir:
+    for cand in ("/home/user/.cache/hf", "/tmp/hf", "/workspace/.cache/hf"):
+        try:
+            os.makedirs(cand, exist_ok=True)
+            cache_dir = cand
+            break
+        except Exception:
+            continue
+
+# Last-resort fallback
+if not cache_dir:
+    cache_dir = "/tmp/hf"
+    os.makedirs(cache_dir, exist_ok=True)
+
+# Point all HF caches to the same place
+os.environ["HF_HOME"] = cache_dir
+os.environ["HF_HUB_CACHE"] = cache_dir
+os.environ["HUGGINGFACE_HUB_CACHE"] = cache_dir
+os.environ["TRANSFORMERS_CACHE"] = cache_dir
+
+# ---------------- App imports ----------------
 import traceback
 from typing import Any, Dict, List
 from fastapi import FastAPI, Depends, HTTPException, Request, status
@@ -31,7 +48,7 @@ from app.utils.guardrails import (
 )
 from app.models import ha_infer, dvp_infer, tm_infer
 
-# -------- Security --------
+# ---------------- Security ----------------
 BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "dev-token")
 
 def require_auth(request: Request):
@@ -42,7 +59,7 @@ def require_auth(request: Request):
     if token != BACKEND_TOKEN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
 
-# -------- App --------
+# ---------------- FastAPI app ----------------
 app = FastAPI(title="DHF Backend (HA/DVP/TM)", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -50,7 +67,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# -------- Helpers --------
+# ---------------- Helpers ----------------
 def _reqs_to_dicts(reqs: List[RequirementInput]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for r in reqs:
@@ -104,7 +121,7 @@ def _normalize_tm_row_api(r: Dict[str, Any]) -> Dict[str, Any]:
     base["ha_risk_controls"] = base["ha_risk_controls"].replace(" ,", ",").replace(", ,", ",").strip()
     return base
 
-# -------- Routes --------
+# ---------------- Routes ----------------
 @app.get("/health")
 def health():
     return {"ok": True}
