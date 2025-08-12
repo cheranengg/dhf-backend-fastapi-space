@@ -1,20 +1,19 @@
-# --- API stack (FastAPI v1 pydantic) ---
-fastapi==0.95.2
-uvicorn[standard]>=0.22.0
-pydantic<2
+# ---- Web framework ----
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
 
-# --- Core ML stack ---
-transformers>=4.41.0
-accelerate>=0.30.0
+# ---- Core scientific stack ----
+numpy>=1.26
+scipy>=1.11
+pandas>=2.2.2
+
+# ---- HF / LLM stack ----
+transformers>=4.43.0
+accelerate>=0.33.0
+huggingface-hub>=0.24.0
 peft>=0.11.0
-# torch comes from the base image (PyTorch 2.3.1 + CUDA 12.1)
-
-# --- Optional/used features ---
-bitsandbytes>=0.43.1
 sentence-transformers>=2.6.1
-faiss-cpu>=1.8.0.post1
-huggingface_hub>=0.23.0
+faiss-cpu>=1.8.0
 
-# --- Utilities ---
-pandas>=2.2.0
-openpyxl>=3.1.2
+# FastAPI runs on Pydantic v2 by default
+pydantic>=2.6.0
