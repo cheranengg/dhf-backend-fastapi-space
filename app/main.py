@@ -1,3 +1,6 @@
+# app/main.py
+from __future__ import annotations
+
 # --- ensure HF cache dir is writable and exists ---
 import os
 cache_dir = (
@@ -5,7 +8,7 @@ cache_dir = (
     or os.environ.get("HF_HUB_CACHE")
     or os.environ.get("HUGGINGFACE_HUB_CACHE")
     or os.environ.get("TRANSFORMERS_CACHE")
-    or "/workspace/.cache/hf"
+    or "/data/.cache/hf"        # on HF Spaces, /data is writable
 )
 os.environ.setdefault("HF_HOME", cache_dir)
 os.environ.setdefault("HF_HUB_CACHE", cache_dir)
@@ -13,10 +16,8 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", cache_dir)
 os.environ.setdefault("TRANSFORMERS_CACHE", cache_dir)
 os.makedirs(cache_dir, exist_ok=True)
 
-# app/main.py
-from __future__ import annotations
-import os, traceback, json
-from typing import Any, Dict, List, Optional
+import traceback
+from typing import Any, Dict, List
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -41,39 +42,23 @@ def require_auth(request: Request):
     if token != BACKEND_TOKEN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid token")
 
-# -------- CORS --------
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
-ALLOWED_ORIGINS_LIST = [o.strip() for o in ALLOWED_ORIGINS.split(",")] if ALLOWED_ORIGINS != "*" else ["*"]
-
 # -------- App --------
-app = FastAPI(title="DHF Backend (HA/DVP/TM)", version=os.getenv("APP_VERSION", "1.0.0"))
+app = FastAPI(title="DHF Backend (HA/DVP/TM)", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS_LIST,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 # -------- Helpers --------
-def _reqs_to_dicts(reqs: List[RequirementInput | Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Normalize incoming requirements to canonical dicts the models expect.
-    - If incoming objects already have 'Requirements', pass through (handled by caller).
-    - If Pydantic RequirementInput objects, preserve Verification ID if present in dict form.
-    """
+def _reqs_to_dicts(reqs: List[RequirementInput]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for r in reqs:
-        if isinstance(r, dict):
-            rid = sanitize_text(str(r.get("Requirement ID") or r.get("requirement_id") or ""))
-            vid = sanitize_text(str(r.get("Verification ID") or r.get("verification_id") or ""))
-            rtxt = sanitize_text(str(r.get("Requirements") or r.get("requirements") or ""))
-        else:
-            # RequirementInput dataclass-like
-            rid = sanitize_text(r.requirement_id or "")
-            vid = ""  # RequirementInput schema usually doesn't include VID
-            rtxt = sanitize_text(r.requirements or "")
-        out.append({"Requirement ID": rid, "Verification ID": vid, "Requirements": rtxt})
+        out.append({
+            "Requirement ID": sanitize_text(r.requirement_id or ""),
+            "Verification ID": "",
+            "Requirements": sanitize_text(r.requirements),
+        })
     return out
 
 def _normalize_ha_row(r: Dict[str, Any]) -> Dict[str, Any]:
@@ -124,39 +109,15 @@ def _normalize_tm_row_api(r: Dict[str, Any]) -> Dict[str, Any]:
 def health():
     return {"ok": True}
 
-@app.get("/ready")
-def ready():
-    """
-    Lightweight readiness check:
-    - Ensures flags/environment are readable
-    - Does NOT run heavy generation
-    """
-    return {
-        "ok": True,
-        "device": ("cuda" if os.getenv("USE_HA_MODEL") == "1" or os.getenv("USE_DVP_MODEL") == "1" or os.getenv("USE_TM_MODEL") == "1" else "cpu"),
-        "flags": {
-            "USE_HA_MODEL": os.getenv("USE_HA_MODEL", "0"),
-            "USE_DVP_MODEL": os.getenv("USE_DVP_MODEL", "0"),
-            "USE_TM_MODEL": os.getenv("USE_TM_MODEL", "0"),
-        }
-    }
-
-@app.get("/version")
-def version():
-    return {"version": app.version}
-
 @app.get("/debug/flags", dependencies=[Depends(require_auth)])
 def debug_flags():
     return {
         "USE_HA_MODEL": os.getenv("USE_HA_MODEL", "0"),
         "USE_DVP_MODEL": os.getenv("USE_DVP_MODEL", "0"),
         "USE_TM_MODEL": os.getenv("USE_TM_MODEL", "0"),
-        "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR", ""),
         "DVP_MODEL_DIR": os.getenv("DVP_MODEL_DIR", ""),
         "TM_MODEL_DIR": os.getenv("TM_MODEL_DIR", ""),
-        "LORA_HA_DIR": os.getenv("LORA_HA_DIR", ""),
-        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID", ""),
-        "HF_CACHE_DIR": os.getenv("HF_CACHE_DIR", ""),
+        "HA_MODEL_MERGED_DIR": os.getenv("HA_MODEL_MERGED_DIR", ""),
     }
 
 @app.post("/debug/smoke", dependencies=[Depends(require_auth)])
@@ -179,8 +140,7 @@ def hazard_analysis(payload: Dict[str, Any]):
         raw_reqs = payload.get("requirements", [])
         if not isinstance(raw_reqs, list) or not raw_reqs:
             raise HTTPException(400, "`requirements` must be a non-empty list")
-        # pass-through if canonical; else normalize
-        reqs_dict = raw_reqs if isinstance(raw_reqs[0], dict) and "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
+        reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
         ha_rows_raw: List[Dict[str, Any]] = ha_infer.ha_predict(reqs_dict)
         ha_rows_norm = [_normalize_ha_row(r) for r in ha_rows_raw]
         return {"ha": [HazardAnalysisRow(**row) for row in ha_rows_norm]}  # type: ignore
@@ -196,7 +156,7 @@ def dvp(payload: Dict[str, Any]):
         ha_rows = payload.get("ha", [])
         if not isinstance(raw_reqs, list) or not raw_reqs:
             raise HTTPException(400, "`requirements` must be a non-empty list")
-        reqs_dict = raw_reqs if isinstance(raw_reqs[0], dict) and "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
+        reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
         dvp_rows_raw: List[Dict[str, Any]] = dvp_infer.dvp_predict(reqs_dict, ha_rows)
         dvp_rows_norm = [_normalize_dvp_row(r) for r in dvp_rows_raw]
         return {
@@ -222,34 +182,12 @@ def trace_matrix(payload: Dict[str, Any]):
         dvp_rows = payload.get("dvp", [])
         if not isinstance(raw_reqs, list) or not raw_reqs:
             raise HTTPException(400, "`requirements` must be a non-empty list")
-        reqs_dict = raw_reqs if isinstance(raw_reqs[0], dict) and "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
+        reqs_dict = raw_reqs if "Requirements" in (raw_reqs[0] or {}) else _reqs_to_dicts(raw_reqs)
         tm_rows_raw: List[Dict[str, Any]] = tm_infer.tm_predict(reqs_dict, ha_rows, dvp_rows)
         tm_rows_norm = [_normalize_tm_row_api(r) for r in tm_rows_raw]
-        result = guard_tm_rows(tm_rows_norm, allowed_methods=DEFAULT_ALLOWED_METHODS)
-        # You can log result.issues here for telemetry if needed
+        _ = guard_tm_rows(tm_rows_norm, allowed_methods=DEFAULT_ALLOWED_METHODS)  # optional
         return {"trace_matrix": [TraceMatrixRow(**row) for row in tm_rows_norm]}  # type: ignore
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, f"TM failed: {e}")
-
-# -------- Optional: warmup on startup (no heavy gen) --------
-@app.on_event("startup")
-def _maybe_warmup():
-    """
-    If WARMUP=1, try to lightly touch model loaders to pay the import cost early.
-    This won't run full generation or block the service for long.
-    """
-    if os.getenv("WARMUP", "0") != "1":
-        return
-    try:
-        # Touch loaders safely (no prompt generation)
-        if os.getenv("USE_HA_MODEL", "0") == "1":
-            ha_infer._load_model()  # type: ignore[attr-defined]
-        if os.getenv("USE_DVP_MODEL", "0") == "1":
-            dvp_infer._load_model()  # type: ignore[attr-defined]
-        if os.getenv("USE_TM_MODEL", "0") == "1":
-            tm_infer._load_tm_model()  # type: ignore[attr-defined]
-    except Exception:
-        # Warmup is best-effort; never block startup
-        pass
