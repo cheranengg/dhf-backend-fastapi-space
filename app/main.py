@@ -1,3 +1,18 @@
+# --- ensure HF cache dir is writable and exists ---
+import os
+cache_dir = (
+    os.environ.get("HF_HOME")
+    or os.environ.get("HF_HUB_CACHE")
+    or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    or os.environ.get("TRANSFORMERS_CACHE")
+    or "/workspace/.cache/hf"
+)
+os.environ.setdefault("HF_HOME", cache_dir)
+os.environ.setdefault("HF_HUB_CACHE", cache_dir)
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", cache_dir)
+os.environ.setdefault("TRANSFORMERS_CACHE", cache_dir)
+os.makedirs(cache_dir, exist_ok=True)
+
 # app/main.py
 from __future__ import annotations
 import os, traceback, json
