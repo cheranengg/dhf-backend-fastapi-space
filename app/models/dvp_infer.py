@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional
 USE_DVP_MODEL = os.getenv("USE_DVP_MODEL", "0") == "1"
 DVP_MODEL_DIR = os.getenv("DVP_MODEL_DIR", "/models/mistral_finetuned_Design_Verification_Protocol")
 HF_TOKEN = os.getenv("HF_TOKEN")
-
+HF_HOME = os.getenv("HF_HOME")
 if USE_DVP_MODEL:
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -67,13 +67,13 @@ def _load_model():
     global _tokenizer, _model
     if not USE_DVP_MODEL or _model is not None:
         return
-    token_kw = {"use_auth_token": HF_TOKEN} if HF_TOKEN else {}
+    token_kw = {"token": HF_TOKEN} if HF_TOKEN else {}
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
-    _tokenizer = AutoTokenizer.from_pretrained(DVP_MODEL_DIR, **token_kw)  # type: ignore
+    _tokenizer = AutoTokenizer.from_pretrained(DVP_MODEL_DIR, **token_kw, cache_dir=HF_HOME)  # type: ignore
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token  # type: ignore
-    _model = AutoModelForCausalLM.from_pretrained(DVP_MODEL_DIR, torch_dtype=DTYPE, **token_kw)  # type: ignore
+    _model = AutoModelForCausalLM.from_pretrained(DVP_MODEL_DIR, torch_dtype=DTYPE, **token_kw, cache_dir=HF_HOME)  # type: ignore
     _model.to(DEVICE)  # type: ignore
 
 # ---------------- Test procedure generation ----------------
