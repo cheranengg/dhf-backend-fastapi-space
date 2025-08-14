@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import startup_cleanup
 from typing import Any, Dict, List
 
 from fastapi import Body, FastAPI, Header, HTTPException
