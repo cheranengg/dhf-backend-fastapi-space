@@ -68,11 +68,16 @@ def _load_tokenizer():
     # 1) slow tokenizer (no protobuf needed)
     try:
         tok = AutoTokenizer.from_pretrained(
-            HA_MODEL_DIR, use_fast=False, **_token_cache_kwargs()
+            HA_MODEL_DIR, use_fast=False, trust_remote_code=True, **_token_cache_kwargs()
         )
-        # Newer tokenizers expose `.legacy`; set to True to avoid protobuf code paths
+        # set pad token defensively
         try:
-            # Not all tokenizers have this attr; best-effort
+            if getattr(tok, "pad_token", None) is None:
+                tok.pad_token = tok.eos_token  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        # Newer tokenizers sometimes expose `.legacy`; set to True to avoid protobuf code paths
+        try:
             tok.legacy = True  # type: ignore[attr-defined]
         except Exception:
             pass
@@ -84,8 +89,10 @@ def _load_tokenizer():
     # 2) fallback: fast tokenizer (will need protobuf installed)
     try:
         tok = AutoTokenizer.from_pretrained(
-            HA_MODEL_DIR, use_fast=True, **_token_cache_kwargs()
+            HA_MODEL_DIR, use_fast=True, trust_remote_code=True, **_token_cache_kwargs()
         )
+        if getattr(tok, "pad_token", None) is None:
+            tok.pad_token = tok.eos_token  # type: ignore[attr-defined]
         _tokenizer = tok
         return _tokenizer
     except Exception as e:
@@ -117,10 +124,14 @@ def _load_model():
 
     try:
         _model = AutoModelForCausalLM.from_pretrained(
-            HA_MODEL_DIR, torch_dtype=dtype, **_token_cache_kwargs()
+            HA_MODEL_DIR, torch_dtype=dtype, trust_remote_code=True, **_token_cache_kwargs()
         )
         if getattr(tok, "pad_token", None) is None:
             tok.pad_token = tok.eos_token  # type: ignore[attr-defined]
+        try:
+            _model.config.pad_token_id = tok.pad_token_id  # type: ignore
+        except Exception:
+            pass
         _model.to("cuda" if torch.cuda.is_available() else "cpu")
     except Exception as e:
         # Make sure we propagate a clear error to the API layer
