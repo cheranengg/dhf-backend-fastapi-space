@@ -1,4 +1,3 @@
-# app/models/dvp_infer.py
 from __future__ import annotations
 import os
 from typing import List, Dict, Any, Optional
@@ -30,15 +29,12 @@ VISUAL_KWS    = ["label", "marking", "display", "visual", "color"]
 TECH_KWS      = ["electrical", "mechanical", "flow", "pressure", "occlusion", "accuracy", "alarm"]
 
 TEST_SPEC_LOOKUP = {
-    # IEC 60601-1 (Electrical Safety)
     "insulation": "≥ 50 MΩ at 500 V DC (IEC 60601-1)",
     "leakage":    "≤ 100 µA at rated voltage (IEC 60601-1)",
     "dielectric": "1500 V AC for 1 min, no breakdown (IEC 60601-1)",
     "earth":      "Earth continuity ≤ 0.1 Ω at 25 A for 1 min (IEC 60601-1)",
-    # Infusion pumps
     "flow":       "±5% from set value (IEC 60601-2-24)",
     "occlusion":  "Alarm ≤ 30 s at 100 kPa back pressure (IEC 60601-2-24)",
-    # Connectors / EMC / Env
     "luer":       "No leakage under 300 kPa for 30 s (ISO 80369-7)",
     "emc":        "±6 kV contact, ±8 kV air (IEC 61000-4-2)",
     "vibration":  "10–500 Hz, 0.5 g, 2 h/axis (IEC 60068-2-6)",
@@ -55,9 +51,8 @@ def _get_verification_method(req_text: str) -> str:
     return "Physical Inspection"
 
 def _get_sample_size(requirement_id: str, ha_items: List[Dict[str, Any]]) -> str:
-    """Map to HA severity if provided; else derive from ID for stability."""
     sev = None
-    for h in ha_items or []:
+    for h in (ha_items or []):
         rid = str(h.get("requirement_id") or h.get("Requirement ID") or "")
         if rid and rid == str(requirement_id):
             s = h.get("severity_of_harm") or h.get("Severity of Harm")
@@ -88,7 +83,6 @@ def _load_tokenizer():
 
     last_exc: Optional[Exception] = None
 
-    # 1) slow tokenizer (no protobuf)
     try:
         tok = AutoTokenizer.from_pretrained(
             DVP_MODEL_DIR, use_fast=False, trust_remote_code=True, **_token_cache_kwargs()
@@ -107,7 +101,6 @@ def _load_tokenizer():
     except Exception as e:
         last_exc = e
 
-    # 2) fallback to fast (requires protobuf)
     try:
         tok = AutoTokenizer.from_pretrained(
             DVP_MODEL_DIR, use_fast=True, trust_remote_code=True, **_token_cache_kwargs()
@@ -123,7 +116,7 @@ def _load_tokenizer():
         )
 
 def _load_model():
-    """Load ONLY the fine-tuned DVP model; device_map=auto + CPU offload; pad_token fix."""
+    """Load ONLY the fine-tuned DVP model; device_map=auto + optional offload; pad_token fix."""
     global _tokenizer, _model
     if not USE_DVP_MODEL or _model is not None:
         return
@@ -151,6 +144,16 @@ def _load_model():
     if device_map is None:
         _model.to("cpu" if FORCE_CPU or not torch.cuda.is_available() else "cuda")
 
+def _model_device():
+    """Return the device the model actually resides on."""
+    import torch
+    if _model is None:
+        return torch.device("cpu")
+    try:
+        return next(_model.parameters()).device
+    except Exception:
+        return torch.device("cuda" if torch.cuda.is_available() and not FORCE_CPU else "cpu")
+
 def _clear_cuda():
     try:
         import torch, gc
@@ -171,17 +174,21 @@ GEN_PROMPT_TMPL = (
 )
 
 def _gen_test_procedure_model(requirement_text: str) -> str:
-    """Generate bullets; fall back to CPU & fewer tokens on OOM."""
+    """Generate bullets; keep inputs on the SAME device as the model."""
     _load_model()
     if _model is None:
         return _gen_test_procedure_stub(requirement_text)
 
     import torch, re
-    device = "cuda" if (torch.cuda.is_available() and not FORCE_CPU) else "cpu"
+    dev = _model_device()
     prompt = GEN_PROMPT_TMPL.format(req=requirement_text or "the feature")
 
     def _run(max_new: int) -> str:
-        inputs = _tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).to(device)  # type: ignore
+        inputs = _tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+        # Only move to CUDA if the model is on CUDA; otherwise leave on CPU.
+        if dev.type == "cuda":
+            inputs = inputs.to(dev)  # type: ignore
+
         with torch.no_grad():
             out = _model.generate(  # type: ignore
                 **inputs,
@@ -192,7 +199,6 @@ def _gen_test_procedure_model(requirement_text: str) -> str:
             )
         text = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
 
-        # Keep just the 3–4 best bullet-ish lines
         bullets = []
         for line in text.split("\n"):
             line = line.strip(" -•\t")
@@ -202,7 +208,6 @@ def _gen_test_procedure_model(requirement_text: str) -> str:
                 break
         cleaned = "\n".join(bullets)
         if not cleaned:
-            # attempt numbered-steps extraction if bullets absent
             m = re.findall(r"\d+\..{10,}", text)
             bullets = [f"- {s.strip()}" for s in m[:4]]
             cleaned = "\n".join(bullets) if bullets else "TBD"
@@ -246,12 +251,11 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
     _load_model()  # may be no-op if USE_DVP_MODEL=0
 
     rows: List[Dict[str, Any]] = []
-    for r in requirements or []:
+    for r in (requirements or []):
         rid = str(r.get("Requirement ID") or r.get("requirement_id") or "")
         vid = str(r.get("Verification ID") or r.get("verification_id") or "")
         rtxt = str(r.get("Requirements") or r.get("requirements") or "").strip()
 
-        # Section titles like "... Requirements"
         if rtxt.lower().endswith("requirements") and not vid:
             rows.append({
                 "verification_id": vid, "requirement_id": rid, "requirements": rtxt,
@@ -262,7 +266,6 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
 
         method = _get_verification_method(rtxt)
         sample = _get_sample_size(rid, ha or [])
-
         bullets = _gen_test_procedure(rtxt)
 
         ac = "TBD"
