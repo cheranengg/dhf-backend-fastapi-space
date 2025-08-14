@@ -290,7 +290,7 @@ def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     inputs = _tokenizer(prompt, return_tensors="pt").to(device)  # type: ignore
     with torch.no_grad():
         out = _model.generate(  # type: ignore
-            **inputs, max_new_tokens=256, temperature=0.3, do_sample=True, top_p=0.9
+            **inputs, max_new_tokens=256, temperature=0.2, do_sample=True, top_p=0.9
         )
     decoded = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
     return _extract_json(decoded) or {}
