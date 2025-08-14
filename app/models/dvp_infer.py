@@ -78,22 +78,62 @@ def _get_sample_size(requirement_id: str, ha_items: List[Dict[str, Any]]) -> str
 _tokenizer: Optional["AutoTokenizer"] = None
 _model: Optional["AutoModelForCausalLM"] = None
 
+def _load_tokenizer():
+    """Prefer slow tokenizer (SentencePiece) to avoid protobuf/fast-tokenizer issues."""
+    from transformers import AutoTokenizer
+    global _tokenizer
+
+    if _tokenizer is not None:
+        return _tokenizer
+
+    last_exc: Optional[Exception] = None
+
+    # 1) slow tokenizer (no protobuf)
+    try:
+        tok = AutoTokenizer.from_pretrained(
+            DVP_MODEL_DIR, use_fast=False, trust_remote_code=True, **_token_cache_kwargs()
+        )
+        try:
+            if getattr(tok, "pad_token", None) is None:
+                tok.pad_token = tok.eos_token  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            tok.legacy = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        _tokenizer = tok
+        return _tokenizer
+    except Exception as e:
+        last_exc = e
+
+    # 2) fallback to fast (requires protobuf)
+    try:
+        tok = AutoTokenizer.from_pretrained(
+            DVP_MODEL_DIR, use_fast=True, trust_remote_code=True, **_token_cache_kwargs()
+        )
+        if getattr(tok, "pad_token", None) is None:
+            tok.pad_token = tok.eos_token  # type: ignore[attr-defined]
+        _tokenizer = tok
+        return _tokenizer
+    except Exception as e:
+        last_exc = e
+        raise RuntimeError(
+            f"DVP tokenizer load failed. Tried: [{DVP_MODEL_DIR}]. Last error: {last_exc}"
+        )
+
 def _load_model():
     """Load ONLY the fine-tuned DVP model; device_map=auto + CPU offload; pad_token fix."""
     global _tokenizer, _model
     if not USE_DVP_MODEL or _model is not None:
         return
 
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    import torch, os
+    from transformers import AutoModelForCausalLM
+    import torch
 
+    _load_tokenizer()
     dtype = torch.float16 if (torch.cuda.is_available() and not FORCE_CPU) else torch.float32
     device_map = "auto" if (torch.cuda.is_available() and not FORCE_CPU) else None
-
-    # tokenizer from merged repo (fixed like HA)
-    _tokenizer = AutoTokenizer.from_pretrained(DVP_MODEL_DIR, **_token_cache_kwargs())
-    if _tokenizer.pad_token is None:
-        _tokenizer.pad_token = _tokenizer.eos_token  # prevents pad/eos cuda op during generate
 
     _model = AutoModelForCausalLM.from_pretrained(
         DVP_MODEL_DIR,
@@ -101,10 +141,11 @@ def _load_model():
         low_cpu_mem_usage=True,
         device_map=device_map,
         offload_folder=OFFLOAD_DIR if device_map == "auto" else None,
+        trust_remote_code=True,
         **_token_cache_kwargs()
     )
     try:
-        _model.config.pad_token_id = _tokenizer.pad_token_id  # extra guard
+        _model.config.pad_token_id = _tokenizer.pad_token_id  # type: ignore
     except Exception:
         pass
     if device_map is None:
