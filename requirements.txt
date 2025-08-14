@@ -17,3 +17,6 @@ faiss-cpu>=1.8.0
 
 # FastAPI runs on Pydantic v2 by default
 pydantic>=2.6.0
+
+sentencepiece
+protobuf==4.25.3
