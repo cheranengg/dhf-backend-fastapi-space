@@ -269,8 +269,8 @@ def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     with torch.no_grad():
         out = _model.generate(  # type: ignore
             **inputs,
-            max_new_tokens=192,
-            temperature=0.3,
+            max_new_tokens=256,
+            temperature=0.2,
             do_sample=True,
             top_p=0.9,
         )
