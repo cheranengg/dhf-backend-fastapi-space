@@ -3,23 +3,24 @@ from __future__ import annotations
 
 import os, re, json, time
 from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 import numpy as np
 
 # =========================
-# Env & defaults (ADAPTER-ONLY)
+# Adapter-only config
 # =========================
-USE_HA_ADAPTER = os.getenv("USE_HA_ADAPTER", "1") == "1"
-HA_ADAPTER_REPO = os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter")
-BASE_MODEL_ID = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
+USE_HA_ADAPTER   = os.getenv("USE_HA_ADAPTER", "1") == "1"
+HA_ADAPTER_REPO  = os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter")
+BASE_MODEL_ID    = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
 
 # Generation knobs
-HA_MAX_NEW_TOKENS     = int(os.getenv("HA_MAX_NEW_TOKENS", "256"))
-DO_SAMPLE             = os.getenv("DO_SAMPLE", os.getenv("do_sample", "0")) == "1"
-NUM_BEAMS             = int(os.getenv("NUM_BEAMS", "1"))
-TEMPERATURE           = float(os.getenv("TEMPERATURE", "0.2"))
-TOP_P                 = float(os.getenv("TOP_P", "0.9"))
-REPETITION_PENALTY    = float(os.getenv("REPETITION_PENALTY", "1.05"))
+HA_MAX_NEW_TOKENS   = int(os.getenv("HA_MAX_NEW_TOKENS", "256"))
+DO_SAMPLE           = os.getenv("DO_SAMPLE", os.getenv("do_sample", "0")) == "1"
+NUM_BEAMS           = int(os.getenv("NUM_BEAMS", "1"))
+TEMPERATURE         = float(os.getenv("TEMPERATURE", "0.2"))
+TOP_P               = float(os.getenv("TOP_P", "0.9"))
+REPETITION_PENALTY  = float(os.getenv("REPETITION_PENALTY", "1.05"))
 
 # HF cache/auth
 FORCE_CPU = os.getenv("FORCE_CPU", "0") == "1"
@@ -43,7 +44,7 @@ def _token_cache_kwargs() -> Dict[str, Any]:
     return kw
 
 # =========================
-# Optional embeddings (MiniLM) for nearest requirement & similarity checks
+# Optional embeddings (MiniLM)
 # =========================
 _HAS_EMB = False
 try:
@@ -51,39 +52,39 @@ try:
     _HAS_EMB = True
 except Exception:
     _HAS_EMB = False
-_emb = None   # sentence-transformers model or None
+_emb = None
 
 # =========================
-# Globals for model & tokenizer
+# Globals
 # =========================
 _tokenizer = None  # type: ignore
 _model = None      # type: ignore
 
 # =========================
-# Synthetic RAG
+# Synthetic RAG (used ONLY for enums/backfill)
 # =========================
 RAG_SYNTHETIC_PATH = os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl")
-_RAG_DB: List[Dict[str, Any]] = []   # list of canonicalized dicts
-_RAG_TEXTS: List[str] = []           # concatenated text for similarity
+_RAG_DB: List[Dict[str, Any]] = []
+_RAG_TEXTS: List[str] = []
 
 # =========================
-# MAUDE live fetch
+# MAUDE fetch
 # =========================
-MAUDE_FETCH     = os.getenv("MAUDE_FETCH", "0") == "1"
+MAUDE_FETCH     = os.getenv("MAUDE_FETCH", "1") == "1"      # <-- default ON per your request
 MAUDE_DEVICE    = os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM")
-MAUDE_LIMIT     = int(os.getenv("MAUDE_LIMIT", "20"))
+MAUDE_LIMIT     = int(os.getenv("MAUDE_LIMIT", "30"))
 MAUDE_TTL       = int(os.getenv("MAUDE_TTL", "86400"))
 MAUDE_CACHE_DIR = os.getenv("MAUDE_CACHE_DIR", "/tmp/maude_cache")
 
 # =========================
-# Anti-copy (paraphrase) controls
+# Anti-copy (from RAG) controls
 # =========================
 PARAPHRASE_FROM_RAG   = os.getenv("PARAPHRASE_FROM_RAG", "1") == "1"
-SIM_THRESHOLD         = float(os.getenv("SIM_THRESHOLD", "0.92"))
-PARAPHRASE_MAX_WORDS  = int(os.getenv("PARAPHRASE_MAX_WORDS", "20"))
+SIM_THRESHOLD         = float(os.getenv("SIM_THRESHOLD", "0.9"))  # a bit stricter
+PARAPHRASE_MAX_WORDS  = int(os.getenv("PARAPHRASE_MAX_WORDS", "18"))
 
 # =========================
-# Default risks per requirement
+# Risks per requirement
 # =========================
 _DEFAULT_RISKS = [
     "Air Embolism","Allergic response","Infection","Overdose","Underdose",
@@ -91,7 +92,7 @@ _DEFAULT_RISKS = [
 ]
 
 # =========================
-# Tokenizer / Model loaders (adapter-only)
+# Loaders
 # =========================
 def _load_tokenizer():
     global _tokenizer
@@ -123,7 +124,6 @@ def _init_embeddings():
             _emb = None
 
 def _load_model():
-    """Adapter-only, device_map='auto'."""
     global _model
     if _model is not None:
         return
@@ -142,7 +142,7 @@ def _load_model():
     _load_rag_db()
 
 # =========================
-# Synthetic RAG loader
+# RAG loader (canonicalize; keep for enums only)
 # =========================
 _CANON_KEYS = {
     "risk id": "Risk ID",
@@ -164,17 +164,16 @@ def _canon_record_keys(rec: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in rec.items():
         ck = _CANON_KEYS.get(str(k).strip().lower(), k)
         out[ck] = v
-    for k, v in list(out.items()):
-        if isinstance(v, str):
-            out[k] = v.strip()
+    for k in list(out.keys()):
+        if isinstance(out[k], str):
+            out[k] = out[k].strip()
     sev = out.get("Severity of Harm")
     if isinstance(sev, (int, float)) or (isinstance(sev, str) and sev.isdigit()):
-        n = max(1, min(4, int(sev)))
-        out["Severity of Harm"] = f"S{n}"
+        out["Severity of Harm"] = f"S{max(1, min(4, int(sev)))}"
     return out
 
 def _load_rag_db():
-    global _RAG_DB, _RAG_TEXTS, RAG_SYNTHETIC_PATH
+    global _RAG_DB, _RAG_TEXTS
     if _RAG_DB:
         return
     try:
@@ -182,8 +181,7 @@ def _load_rag_db():
             with open(RAG_SYNTHETIC_PATH, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
-                    if not line:
-                        continue
+                    if not line: continue
                     try:
                         rec = json.loads(line)
                     except Exception:
@@ -212,8 +210,7 @@ def _load_rag_db():
 # JSON extraction / cleanup
 # =========================
 def _balanced_json_block(text: str) -> Optional[str]:
-    if not text:
-        return None
+    if not text: return None
     depth, start = 0, -1
     for i, ch in enumerate(text):
         if ch == "{":
@@ -236,7 +233,7 @@ def _repair_json_str(js: str) -> Optional[Dict[str, Any]]:
         return json.loads(s)
     except Exception:
         try:
-            import json5  # optional
+            import json5
             return json5.loads(s)
         except Exception:
             return None
@@ -246,7 +243,7 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return _repair_json_str(js) if js else None
 
 # =========================
-# Enums / scoring
+# Enums & scoring
 # =========================
 _SEV_NUM = {"S1":1,"S2":2,"S3":3,"S4":4}
 _P_CANON = {
@@ -283,7 +280,7 @@ def _calculate_risk_fields(parsed: Dict[str, Any]) -> Tuple[int,str,str,str,str]
     return s_num, p0, p1, poh, ri
 
 # =========================
-# LLM prompting helpers
+# LLM generation
 # =========================
 _PROMPT = """You are generating ONE Hazard Analysis record as STRICT JSON ONLY.
 Return EXACTLY one JSON object and nothing else.
@@ -331,7 +328,7 @@ def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
         return {}
     decoded = _generate_text(_PROMPT.format(risk=risk))
     js = _extract_json(decoded) or {}
-    # retry if any core field blank
+    # retry if blank core fields
     needs = [k for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"] if not str(js.get(k,"")).strip()]
     if needs:
         decoded = _generate_text(_PROMPT.format(risk=risk) + "\nDo not leave any field blank.")
@@ -342,7 +339,7 @@ def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     return js
 
 # =========================
-# Anti-copy helpers (similarity + paraphrase)
+# Anti-copy helpers
 # =========================
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9
@@ -377,34 +374,26 @@ def _maybe_paraphrase_if_similar(source: str, candidate: str) -> str:
             return c
         except Exception:
             pass
-    # fallback: token overlap
+    # token overlap fallback
     s_tok = set(re.findall(r"[A-Za-z]+", s.lower()))
     c_tok = set(re.findall(r"[A-Za-z]+", c.lower()))
     overlap = len(s_tok & c_tok) / (len(c_tok) + 1e-9)
     return _llm_paraphrase(c) if overlap > 0.85 else c
 
 # =========================
-# RAG + MAUDE enrichment & provenance-aware paraphrase
+# RAG helpers (only for enums/backfill)
 # =========================
-def _lookup_exact_rag(risk: str) -> Optional[Dict[str, Any]]:
+def _lookup_rag_record(risk: str) -> Optional[Dict[str, Any]]:
     if not _RAG_DB:
         return None
     for r in _RAG_DB:
         if str(r.get("Risk to Health","")).strip().lower() == risk.strip().lower():
             return r
-    # simple embedding fallback
-    if _HAS_EMB and _emb is not None and _RAG_TEXTS:
-        try:
-            emb = _emb.encode(_RAG_TEXTS, convert_to_numpy=True)  # type: ignore
-            q = _emb.encode([risk], convert_to_numpy=True)[0]     # type: ignore
-            sims = (emb @ q) / (np.linalg.norm(emb, axis=1) * (np.linalg.norm(q) + 1e-9))
-            i = int(sims.argmax())
-            if float(sims[i]) >= 0.55:
-                return _RAG_DB[i]
-        except Exception:
-            pass
     return None
 
+# =========================
+# MAUDE fetch + synthesis (preferred for wording)
+# =========================
 def _cache_path(device_brand: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", device_brand.strip()) or "device"
     os.makedirs(MAUDE_CACHE_DIR, exist_ok=True)
@@ -433,22 +422,54 @@ def _fetch_maude_events(device_brand: str, limit: int) -> List[Dict[str, Any]]:
         "search": f'device.brand_name:"{device_brand}" OR device.generic_name:"{device_brand}"',
         "limit": max(1, min(100, int(limit))),
     }
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json().get("results", [])
 
-def _maude_llm_extract(text: str) -> Optional[Dict[str, str]]:
-    prompt = f"""Extract these fields in JSON only:
+def _synthesize_from_maude(events: List[Dict[str, Any]], risk: str) -> Dict[str, Any]:
+    """
+    Summarize multiple MAUDE events into 4 fields via the adapter.
+    This produces original wording grounded in MAUDE text.
+    """
+    if not events:
+        return {}
+    # Build a compact bullet list to keep prompt size reasonable
+    bullets = []
+    for e in events[:10]:
+        txt = e.get("event_description") or e.get("description_of_event") or ""
+        if not txt: continue
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if len(txt) > 400:  # clip long narratives
+            txt = txt[:400] + "..."
+        bullets.append(f"- {txt}")
+    context = "\n".join(bullets)
+
+    prompt = f"""Using ONLY the following adverse event narratives, produce STRICT JSON with:
 {{
   "Hazard": "",
   "Hazardous Situation": "",
   "Harm": "",
   "Sequence of Events": ""
 }}
-Text:
-{text}"""
+
+Rules:
+- Be specific but <= 18 words per field.
+- Use clinical wording; do not copy sentences from the list.
+- Output JSON only.
+
+Risk to Health: {risk}
+
+Event narratives:
+{context}
+"""
     decoded = _generate_text(prompt)
-    return _extract_json(decoded) or None
+    js = _extract_json(decoded) or {}
+    # tiny cleanups
+    for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]:
+        v = (js.get(k) or "").strip()
+        v = re.sub(r"\s+", " ", v)
+        js[k] = v
+    return js
 
 def _get_maude_rows(device_brand: str, risk_to_health: str) -> List[Dict[str, Any]]:
     cached = _load_cached(device_brand, MAUDE_TTL)
@@ -456,66 +477,22 @@ def _get_maude_rows(device_brand: str, risk_to_health: str) -> List[Dict[str, An
         return cached
     try:
         evs = _fetch_maude_events(device_brand, MAUDE_LIMIT)
-        rows: List[Dict[str, Any]] = []
-        for ev in evs:
-            text = ev.get("event_description") or ev.get("description_of_event") or ""
-            mapping = _maude_llm_extract(text) if USE_HA_ADAPTER else None
-            if not mapping:
-                t = text.lower()
-                hazard = "Device malfunction"
-                if re.search(r"\bair\b|\bembol", t): hazard = "Air in Line"
-                elif "occlus" in t: hazard = "Occlusion / Blockage"
-                elif re.search(r"leak|spil|drip", t): hazard = "Fluid Leak"
-                elif re.search(r"alarm|audible|visual", t): hazard = "Alarm Failure / Misuse"
-                elif re.search(r"power|battery|shutdown", t): hazard = "Power Interruption"
-                mapping = {
-                    "Hazard": hazard,
-                    "Hazardous Situation": "Patient exposed due to device malfunction or misuse",
-                    "Harm": "Potential patient injury",
-                    "Sequence of Events": "Setup/use error with inadequate mitigation",
-                }
-            rows.append({"Risk to Health": risk_to_health, **mapping})
-        _save_cached(device_brand, rows)
-        return rows
+        _save_cached(device_brand, evs)
+        return evs
     except Exception:
         return []
 
-def _merge_with_rag_and_maude(parsed: Dict[str, Any], risk: str) -> Dict[str, Any]:
-    rag_filled: Dict[str, str] = {}
-
-    # Synthetic RAG first
-    rec = _lookup_exact_rag(risk)
-    if rec:
-        for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events",
-                  "Severity of Harm","P0","P1","Risk Control","PoH","Risk Index"]:
-            if not str(parsed.get(k,"")).strip() and rec.get(k):
-                parsed[k] = rec[k]
-                rag_filled[k] = rec[k]
-
-    # MAUDE enrichment second
-    if MAUDE_FETCH:
-        rows = _get_maude_rows(MAUDE_DEVICE, risk)
-        for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]:
-            if not str(parsed.get(k,"")).strip():
-                for r in rows:
-                    v = r.get(k)
-                    if v:
-                        parsed[k] = v
-                        break
-
-    # Paraphrase only fields lifted directly from RAG
-    for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events","Risk Control"]:
-        if k in rag_filled:
-            parsed[k] = _maybe_paraphrase_if_similar(rag_filled[k], parsed[k])
-
-    return parsed
-
 # =========================
-# Risk control helpers
+# Risk control (no IDs; no refs)
 # =========================
+def _strip_ids_refs(text: str) -> str:
+    if not text: return text
+    s = re.sub(r"\(Ref:[^)]+\)\s*$", "", text).strip()
+    s = re.sub(r"\bREQ-\d+\b", "", s).strip()
+    return s
+
 def _paraphrase_control(text: str) -> str:
-    if not text:
-        return text
+    if not text: return text
     s = " " + text.strip() + " "
     replacements = [
         (" shall ", " must "), (" will ", " must "), (" ensure ", " make sure "),
@@ -523,68 +500,88 @@ def _paraphrase_control(text: str) -> str:
         (" user ", " operator "), (" device ", " unit "),
     ]
     for a,b in replacements: s = s.replace(a,b)
-    s = s.strip()
+    s = _strip_ids_refs(s.strip())
     if len(s) < 30:
         s = "The design must " + s[0].lower() + s[1:]
     return s
 
-def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> Tuple[str, str]:
-    generic = "Refer to IEC 60601 and ISO 14971 risk controls"
+def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
     if not reqs:
-        return generic, "generic"
+        return "Implement design and operational mitigations aligned with applicable standards and safe-use guidance."
     if not (_HAS_EMB and _emb is not None):
-        return _paraphrase_control(reqs[0].get("Requirements","") or generic), "first"
+        return _paraphrase_control(reqs[0].get("Requirements","") or "")
     try:
         corpus = [str(r.get("Requirements") or "") for r in reqs]
-        ids    = [str(r.get("Requirement ID") or "") for r in reqs]
         vecs = _emb.encode(corpus, convert_to_numpy=True)  # type: ignore
         q    = _emb.encode([hint_text or "risk control"], convert_to_numpy=True)[0]  # type: ignore
         sims = (vecs @ q) / (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(q) + 1e-9))
         top  = int(sims.argmax())
-        chosen = f"{corpus[top]} (Ref: {ids[top]})" if 0 <= top < len(corpus) else generic
-        return _paraphrase_control(chosen), "nearest"
+        chosen = corpus[top] if 0 <= top < len(corpus) else corpus[0]
+        return _paraphrase_control(chosen)
     except Exception:
-        return generic, "generic"
+        return _paraphrase_control(reqs[0].get("Requirements","") or "")
 
 # =========================
 # Row generation
 # =========================
 def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -> Dict[str, Any]:
+    # 1) Start with MAUDE narratives → synthesize 4 fields
     parsed: Dict[str, Any] = {}
-    if USE_HA_ADAPTER:
+    if MAUDE_FETCH:
         try:
-            parsed = _gen_json_for_risk(risk)
+            maude_evs = _get_maude_rows(MAUDE_DEVICE, risk)
+            parsed = _synthesize_from_maude(maude_evs, risk) or {}
         except Exception:
             parsed = {}
 
-    parsed = _merge_with_rag_and_maude(parsed, risk)
+    # 2) If any descriptive field still blank, use adapter prompt (no RAG)
+    if not all((parsed.get(k) for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"])):
+        try:
+            llm_js = _gen_json_for_risk(risk)
+            for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]:
+                if not str(parsed.get(k,"")).strip() and str(llm_js.get(k,"")).strip():
+                    parsed[k] = llm_js[k]
+            # pull enums from LLM if provided
+            for k in ["Severity of Harm","P0","P1"]:
+                if str(llm_js.get(k,"")).strip():
+                    parsed[k] = llm_js[k]
+        except Exception:
+            pass
 
-    # diagnostics
+    # 3) Backfill ONLY enums from RAG (no wording)
+    rec = _lookup_rag_record(risk) or {}
+    for k in ["Severity of Harm","P0","P1","PoH","Risk Index"]:
+        if not str(parsed.get(k,"")).strip() and str(rec.get(k,"")).strip():
+            parsed[k] = rec[k]
+
+    # 4) Anti-copy vs RAG (if somehow text matches a RAG sentence)
+    if rec:
+        for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]:
+            src = rec.get(k, "")
+            if src and parsed.get(k):
+                parsed[k] = _maybe_paraphrase_if_similar(src, parsed[k])
+
+    # 5) Compute enums and risk index if needed
+    severity_num, p0, p1, poh, risk_index = _calculate_risk_fields(parsed or {})
+    poh = parsed.get("PoH", poh)
+    risk_index = parsed.get("Risk Index", risk_index)
+
+    # 6) Risk control (paraphrase requirement, never include IDs)
+    hint = ((parsed.get("Hazardous Situation","") or "") + " " + (parsed.get("Harm","") or "")).strip()
+    control = _nearest_req_control(requirements, hint)
+    control = _strip_ids_refs(control)
+
+    # Diagnostics
     try:
         print({
             "ha_row_debug": True,
-            "req_id": rid,
-            "risk": risk,
-            "rag_rows": len(_RAG_DB),
+            "req_id": rid, "risk": risk,
             "maude_fetch": MAUDE_FETCH,
             "filled": {k: bool(str(parsed.get(k,"")).strip())
-                       for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events","Risk Control"]}
+                       for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]},
         })
     except Exception:
         pass
-
-    severity_num, p0, p1, poh, risk_index = _calculate_risk_fields(parsed or {})
-    rc_from_model = (parsed.get("Risk Control") or "").strip()
-    hint = ((parsed.get("Hazardous Situation","") or "") + " " + (parsed.get("Harm","") or "")).strip()
-    control, _ = _nearest_req_control(requirements, hint)
-    if rc_from_model and len(rc_from_model) > 6:
-        # If model/RAG provided a control, ensure it isn't a copy of RAG text
-        rec = _lookup_exact_rag(risk) or {}
-        src = rec.get("Risk Control","")
-        control = _maybe_paraphrase_if_similar(src, _paraphrase_control(rc_from_model))
-
-    poh = parsed.get("PoH", poh)
-    risk_index = parsed.get("Risk Index", risk_index)
 
     return {
         "requirement_id": rid,
@@ -603,12 +600,9 @@ def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -
     }
 
 # =========================
-# Public API (multi-rows per requirement)
+# Public API
 # =========================
 def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Returns HA rows: for each requirement, one row per default risk.
-    """
     try:
         _load_tokenizer()
         _load_model()
@@ -635,12 +629,12 @@ def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "p1": "Medium",
                     "poh": "Medium",
                     "risk_index": "Medium",
-                    "risk_control": "Refer to IEC 60601 and ISO 14971 risk controls",
+                    "risk_control": "Implement design and operational mitigations aligned with applicable standards and safe-use guidance.",
                 }
             out.append(row)
     return out
 
-# Load RAG at import so /debug endpoints can show rows
+# Load RAG for enums once so /debug endpoints can show rows
 try:
     _load_rag_db()
 except Exception:
