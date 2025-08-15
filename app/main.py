@@ -20,9 +20,15 @@ ENABLE_TM  = os.getenv("ENABLE_TM",  "0") == "1"  # start disabled until ready
 MAX_REQS   = int(os.getenv("MAX_REQS", "10"))
 
 # Import model modules
-from app.models import ha_infer, dvp_infer  # type: ignore
+from app.models import ha_infer  # <- uses infer_ha()
+# DVP/TM are optional modules in your repo; import defensively
+_dvp_available = False
+try:
+    from app.models import dvp_infer  # type: ignore
+    _dvp_available = True
+except Exception:
+    _dvp_available = False
 
-# TM is optional
 _tm_available = False
 try:
     from app.models import tm_infer  # type: ignore
@@ -71,8 +77,8 @@ def _limit_requirements(reqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def health():
     return {
         "ok": True,
-        "enable_dvp": ENABLE_DVP,
-        "enable_tm": ENABLE_TM,
+        "enable_dvp": ENABLE_DVP and _dvp_available,
+        "enable_tm": ENABLE_TM and _tm_available,
         "tm_available": _tm_available,
         "max_reqs": MAX_REQS,
     }
@@ -80,19 +86,19 @@ def health():
 
 @app.get("/debug/ha_status")
 def debug_ha_status():
-    """Adapter-only status + RAG visibility."""
-    rag_path = getattr(ha_infer, "RAG_SYNTHETIC_PATH", "")
-    maude_path = getattr(ha_infer, "RAG_MAUDE_PATH", "")
+    """Adapter-only status + RAG + MAUDE visibility."""
+    rag_rows = len(getattr(ha_infer, "_RAG_DB", []) or [])
     return {
-        "adapter_enabled": getattr(ha_infer, "USE_HA_ADAPTER", False),
-        "adapter_repo": getattr(ha_infer, "HA_ADAPTER_REPO", None),
-        "base_model": getattr(ha_infer, "BASE_MODEL_ID", None),
-        "rag_path": rag_path,
-        "rag_file_exists": os.path.exists(rag_path) if rag_path else False,
-        "rag_rows_loaded": len(getattr(ha_infer, "_RAG_DB", [])),
-        "maude_path": maude_path,
-        "maude_file_exists": os.path.exists(maude_path) if maude_path else False,
-        "maude_rows_loaded": len(getattr(ha_infer, "_MAUDE_DB", [])),
+        "adapter_enabled": bool(os.getenv("USE_HA_ADAPTER", "1") == "1"),
+        "adapter_repo": os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter"),
+        "base_model": os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
+        "rag_path": os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl"),
+        "rag_rows_loaded": rag_rows,
+        # MAUDE internet enrichment
+        "maude_fetch": os.getenv("MAUDE_FETCH", "0") == "1",
+        "maude_device": os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM"),
+        "maude_limit": int(os.getenv("MAUDE_LIMIT", "20")),
+        "maude_ttl": int(os.getenv("MAUDE_TTL", "86400")),
     }
 
 
@@ -117,17 +123,21 @@ def hazard_endpoint(
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
         reqs = _limit_requirements(reqs)
-        ha_rows = ha_infer.ha_predict(reqs)
+
+        # === HA inference (adapter + synthetic RAG + MAUDE enrichment) ===
+        ha_rows = ha_infer.infer_ha(reqs)
 
         if debug:
             diag = {
-                "adapter": getattr(ha_infer, "USE_HA_ADAPTER", False),
-                "adapter_repo": getattr(ha_infer, "HA_ADAPTER_REPO", None),
-                "base_model": getattr(ha_infer, "BASE_MODEL_ID", None),
-                "rag_path": getattr(ha_infer, "RAG_SYNTHETIC_PATH", None),
-                "rag_rows": len(getattr(ha_infer, "_RAG_DB", [])),
-                "maude_path": getattr(ha_infer, "RAG_MAUDE_PATH", None),
-                "maude_rows": len(getattr(ha_infer, "_MAUDE_DB", [])),
+                "adapter": os.getenv("USE_HA_ADAPTER", "1") == "1",
+                "adapter_repo": os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter"),
+                "base_model": os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
+                "rag_path": os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl"),
+                "rag_rows": len(getattr(ha_infer, "_RAG_DB", []) or []),
+                "maude_fetch": os.getenv("MAUDE_FETCH", "0") == "1",
+                "maude_device": os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM"),
+                "maude_limit": int(os.getenv("MAUDE_LIMIT", "20")),
+                "maude_ttl": int(os.getenv("MAUDE_TTL", "86400")),
                 "n_rows": len(ha_rows),
             }
 
@@ -141,13 +151,15 @@ def hazard_endpoint(
             diag.update({
                 "error": str(e),
                 "traceback": tb,
-                "adapter": getattr(ha_infer, "USE_HA_ADAPTER", False),
-                "adapter_repo": getattr(ha_infer, "HA_ADAPTER_REPO", None),
-                "base_model": getattr(ha_infer, "BASE_MODEL_ID", None),
-                "rag_path": getattr(ha_infer, "RAG_SYNTHETIC_PATH", None),
-                "rag_rows": len(getattr(ha_infer, "_RAG_DB", [])),
-                "maude_path": getattr(ha_infer, "RAG_MAUDE_PATH", None),
-                "maude_rows": len(getattr(ha_infer, "_MAUDE_DB", [])),
+                "adapter": os.getenv("USE_HA_ADAPTER", "1") == "1",
+                "adapter_repo": os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter"),
+                "base_model": os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
+                "rag_path": os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl"),
+                "rag_rows": len(getattr(ha_infer, "_RAG_DB", []) or []),
+                "maude_fetch": os.getenv("MAUDE_FETCH", "0") == "1",
+                "maude_device": os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM"),
+                "maude_limit": int(os.getenv("MAUDE_LIMIT", "20")),
+                "maude_ttl": int(os.getenv("MAUDE_TTL", "86400")),
             })
             return {"ok": False, "ha": [], "diag": diag}
         raise HTTPException(status_code=500, detail=f"HA failed: {e}")
@@ -166,13 +178,13 @@ def dvp_endpoint(
     }
     """
     _auth(authorization)
-    if not ENABLE_DVP:
-        raise HTTPException(status_code=503, detail="DVP disabled (ENABLE_DVP=0).")
+    if not (ENABLE_DVP and _dvp_available):
+        raise HTTPException(status_code=503, detail="DVP unavailable.")
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
         ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
         reqs = _limit_requirements(reqs)
-        dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)
+        dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)  # type: ignore
         return {"ok": True, "dvp": dvp_rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DVP failed: {e}")
@@ -193,18 +205,18 @@ def _tm_handler(
     Returns: {"ok": true, "tm": [...]}
     """
     _auth(authorization)
-    if not ENABLE_TM:
-        raise HTTPException(status_code=503, detail="TM disabled (ENABLE_TM=0).")
+    if not (ENABLE_TM and _tm_available):
+        raise HTTPException(status_code=503, detail="TM unavailable.")
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
         ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
         dvp_rows: List[Dict[str, Any]] = payload.get("dvp") or []
         reqs = _limit_requirements(reqs)
 
-        if _tm_available and hasattr(tm_infer, "tm_predict"):
+        if hasattr(tm_infer, "tm_predict"):
             tm_rows = tm_infer.tm_predict(reqs, ha_rows, dvp_rows)  # type: ignore
         else:
-            # lightweight fallback row (no model)
+            # lightweight fallback row (no model): prevents 404s in UI
             from collections import defaultdict
 
             ha_by_req = defaultdict(list)
@@ -291,14 +303,14 @@ def debug_smoke(
          "Requirements": "Labeling shall be legible at 30 cm and use ISO 15223-1 symbols."},
     ]
     try:
-        ha_rows = ha_infer.ha_predict(_limit_requirements(reqs))
+        ha_rows = ha_infer.infer_ha(_limit_requirements(reqs))
         out: Dict[str, Any] = {"ok": True, "ha": ha_rows}
 
-        if ENABLE_DVP:
-            dvp_rows = dvp_infer.dvp_predict(_limit_requirements(reqs), ha_rows)
+        if ENABLE_DVP and _dvp_available:
+            dvp_rows = dvp_infer.dvp_predict(_limit_requirements(reqs), ha_rows)  # type: ignore
             out["dvp"] = dvp_rows
 
-        if ENABLE_TM:
+        if ENABLE_TM and _tm_available:
             out["tm"] = _tm_handler({"requirements": reqs, "ha": ha_rows, "dvp": out.get("dvp", [])}, authorization)["tm"]  # type: ignore
 
         return out
