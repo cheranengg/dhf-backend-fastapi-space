@@ -77,6 +77,14 @@ _model = None  # type: ignore
 _DEVICE = "cpu"
 _emb: Optional["SentenceTransformer"] = None  # type: ignore
 
+# ---------- RAG over synthetic HA ----------
+_RAG_DB: List[Dict[str, Any]] = []
+_RAG_TEXTS: List[str] = []
+_RAG_EMB = None
+RAG_SYNTHETIC_PATH = os.getenv(
+    "HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl"
+)
+
 
 def _load_tokenizer():
     """
@@ -125,7 +133,7 @@ def _load_model():
       - If USE_HA_ADAPTER=1: load BASE model and attach LoRA adapter (HA_ADAPTER_REPO).
       - elif USE_HA_MODEL=1: load merged model from HA_MODEL_DIR.
       - else: leave _model=None (template-only fallback path).
-    Also initializes MiniLM embeddings (best-effort) for requirement proximity.
+    Also initializes MiniLM embeddings (best-effort) for requirement proximity and RAG index.
     """
     global _model, _DEVICE, _emb
 
@@ -138,6 +146,7 @@ def _load_model():
     # If neither adapter nor merged path is enabled, bail early (we'll use fallback rows).
     if not (USE_HA_ADAPTER or USE_HA_MODEL):
         _init_embeddings()
+        _load_rag_db()
         return
 
     tok = _load_tokenizer()
@@ -192,10 +201,11 @@ def _load_model():
         _model.eval()
 
     _init_embeddings()
+    _load_rag_db()
 
 
 def _init_embeddings():
-    """Optional MiniLM embeddings for 'nearest requirement' control text."""
+    """Optional MiniLM embeddings for 'nearest requirement' control text and RAG."""
     global _emb
     if not _HAS_EMB:
         _emb = None
@@ -205,8 +215,64 @@ def _init_embeddings():
     try:
         _emb = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", cache_folder=CACHE_DIR)  # type: ignore
     except Exception:
-        # tolerate embedder failure; we’ll fallback to generic controls
+        # tolerate embedder failure; we’ll fallback to generic controls/RAG off
         _emb = None
+
+
+# =========================
+# RAG helpers
+# =========================
+def _load_rag_db(path: str = RAG_SYNTHETIC_PATH):
+    """Load synthetic HA JSONL into a tiny in-memory 'RAG' store."""
+    global _RAG_DB, _RAG_TEXTS, _RAG_EMB
+    if _RAG_DB:
+        return
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            _RAG_DB.append(rec)
+            _RAG_TEXTS.append(" ".join([
+                str(rec.get("Risk to Health","")),
+                str(rec.get("Hazard","")),
+                str(rec.get("Hazardous Situation","")),
+                str(rec.get("Harm","")),
+                str(rec.get("Sequence of Events","")),
+                str(rec.get("Risk Control","")),
+            ]))
+    if _HAS_EMB:
+        try:
+            _RAG_EMB = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", cache_folder=CACHE_DIR)  # type: ignore
+        except Exception:
+            _RAG_EMB = None
+
+
+def _rag_lookup(risk: str, requirement_text: str = "") -> Optional[Dict[str, Any]]:
+    """Return best-matching synthetic HA row for this risk (or None)."""
+    if not _RAG_DB:
+        return None
+    # prefer exact risk match
+    matches = [r for r in _RAG_DB if str(r.get("Risk to Health","")).strip().lower() == risk.lower()]
+    if matches:
+        return matches[0]
+    # otherwise semantic similarity
+    if not (_HAS_EMB and _RAG_EMB is not None):
+        return None
+    try:
+        import numpy as np  # type: ignore
+        corpus_emb = _RAG_EMB.encode(_RAG_TEXTS, convert_to_numpy=True)  # type: ignore
+        q = _RAG_EMB.encode([risk + " " + requirement_text], convert_to_numpy=True)[0]  # type: ignore
+        sims = (corpus_emb @ q) / (np.linalg.norm(corpus_emb, axis=1) * (np.linalg.norm(q) + 1e-9))
+        i = int(sims.argmax())
+        if float(sims[i]) >= 0.55:
+            return _RAG_DB[i]
+    except Exception:
+        pass
+    return None
 
 
 # =========================
@@ -228,21 +294,19 @@ _default_risks = [
 
 # Canonicalization maps
 _SEV_CANON = {
-    "S1": "S1", "LOW": "S1", "NEGLIGIBLE": "S1", "MINIMAL": "S1",
-    "S2": "S2", "MINOR": "S2", "MEDIUM": "S2", "MODERATE": "S2",
-    "S3": "S3", "MAJOR": "S3", "HIGH": "S3", "SERIOUS": "S3",
-    "S4": "S4", "CRITICAL": "S4", "VERY HIGH": "S4",
-    "S5": "S4",  # coerce out-of-range to S4
+    "S1": "S1", "LOW": "S1", "NEGLIGIBLE": "S1", "MINIMAL": "S1", "1": "S1",
+    "S2": "S2", "MINOR": "S2", "MEDIUM": "S2", "MODERATE": "S2", "2": "S2",
+    "S3": "S3", "MAJOR": "S3", "HIGH": "S3", "SERIOUS": "S3", "3": "S3",
+    "S4": "S4", "CRITICAL": "S4", "VERY HIGH": "S4", "4": "S4",
 }
-# your stored numeric scale 1..5 will be derived from S1..S4 below
 _SEV_NUM = {"S1": 1, "S2": 2, "S3": 3, "S4": 4}
 
 _P_CANON = {
-    "VERY LOW": "Very Low", "VL": "Very Low",
-    "LOW": "Low", "L": "Low",
-    "MEDIUM": "Medium", "MID": "Medium", "M": "Medium",
-    "HIGH": "High", "H": "High",
-    "VERY HIGH": "Very High", "VH": "Very High",
+    "VERY LOW": "Very Low", "VL": "Very Low", "0": "Very Low",
+    "LOW": "Low", "L": "Low", "1": "Low",
+    "MEDIUM": "Medium", "MID": "Medium", "M": "Medium", "2": "Medium",
+    "HIGH": "High", "H": "High", "3": "High",
+    "VERY HIGH": "Very High", "VH": "Very High", "4": "Very High",
 }
 
 def _canon_sev(v: str, default="S3") -> str:
@@ -254,9 +318,7 @@ def _canon_p(v: str, default="Medium") -> str:
     return _P_CANON.get(key, default)
 
 def _balanced_json_block(text: str) -> Optional[str]:
-    """
-    Extract the first balanced {...} block from text (brace-aware).
-    """
+    """Extract the first balanced {...} block from text (brace-aware)."""
     if not text:
         return None
     depth = 0
@@ -281,14 +343,11 @@ def _repair_json_str(js: str) -> Optional[Dict[str, Any]]:
     if not js:
         return None
     s = js
-    # normalize quotes
     s = s.replace("“", '"').replace("”", '"').replace("’", "'")
-    # unify newlines & spaces
     s = s.replace("\\n", " ")
     s = re.sub(r"\s+", " ", s)
-    # trailing commas
     s = re.sub(r",\s*([}\]])", r"\1", s)
-    # single quotes → double quotes (only for keys/strings heuristically)
+    # carefully convert single quotes to double quotes when likely JSON strings
     s = re.sub(r'(?<!\\)\'', '"', s)
     try:
         return json.loads(s)
@@ -343,7 +402,6 @@ def _calculate_risk_fields(parsed: Dict[str, Any]) -> Tuple[int, str, str, str, 
     else:
         risk_index = "Medium"
 
-    # return numeric severity for your schema, plus canonical enums
     return severity_num, p0, p1, poh, risk_index
 
 
@@ -362,21 +420,21 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> Tuple[st
     try:
         corpus = [str(r.get("Requirements") or "") for r in reqs]
         ids = [str(r.get("Requirement ID") or "") for r in reqs]
-        import numpy as np
+        import numpy as np  # type: ignore
 
         # Encode corpus & query
         vecs = _emb.encode(corpus, convert_to_numpy=True)  # type: ignore
         q = _emb.encode([hint_text or "risk control"], convert_to_numpy=True)[0]  # type: ignore
 
         # Cosine similarity
-        denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(q) + 1e-9))
-        sims = (vecs @ q) / np.maximum(denom, 1e-9)
+        sims = (vecs @ q) / (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(q) + 1e-9))
 
         top = int(sims.argmax())
         top_sim = float(sims[top]) if sims.size else 0.0
 
         if sims.size > 1:
-            second = int(np.argsort(-sims)[1])
+            order = list(reversed(list(sims.argsort())))  # high→low
+            second = order[1] if len(order) > 1 else top
             second_sim = float(sims[second])
         else:
             second, second_sim = top, top_sim
@@ -402,7 +460,7 @@ _PROMPT = """You are generating ONE Hazard Analysis record as STRICT JSON ONLY.
 Return EXACTLY one JSON object and nothing else.
 
 Schema:
-{{
+{
   "Hazard": "string",
   "Hazardous Situation": "string",
   "Harm": "string",
@@ -410,7 +468,7 @@ Schema:
   "Severity of Harm": "S1|S2|S3|S4",
   "P0": "Very Low|Low|Medium|High|Very High",
   "P1": "Very Low|Low|Medium|High|Very High"
-}}
+}
 
 Rules:
 - Keep each field concise (<= 20 words).
@@ -479,6 +537,40 @@ def _fallback_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _merge_with_rag_if_needed(parsed: Dict[str, Any], risk: str, requirement_text: str) -> Dict[str, Any]:
+    """
+    If model JSON is missing/weak, fill from synthetic RAG.
+    Only fill empty fields; never overwrite non-empty model fields.
+    """
+    need_rag = (
+        not parsed
+        or all(
+            not str(parsed.get(k, "")).strip()
+            for k in ["Hazard", "Hazardous Situation", "Harm", "Sequence of Events"]
+        )
+    )
+    if not need_rag:
+        return parsed
+
+    rag = _rag_lookup(risk, requirement_text)
+    if not rag:
+        return parsed
+
+    for k in [
+        "Hazard",
+        "Hazardous Situation",
+        "Harm",
+        "Sequence of Events",
+        "Severity of Harm",
+        "P0",
+        "P1",
+        "Risk Control",
+    ]:
+        if not str(parsed.get(k, "")).strip():
+            parsed[k] = rag.get(k, parsed.get(k))
+    return parsed
+
+
 def _gen_row_for_risk(
     requirements: List[Dict[str, Any]], risk: str, rid: str
 ) -> Dict[str, Any]:
@@ -488,6 +580,10 @@ def _gen_row_for_risk(
             parsed = _gen_json_for_risk(risk)
         except Exception:
             parsed = {}
+
+    # Hydrate from synthetic RAG when the model is empty/weak
+    req_text = (requirements[0].get("Requirements", "") if requirements else "")
+    parsed = _merge_with_rag_if_needed(parsed, risk, req_text)
 
     severity_num, p0, p1, poh, risk_index = _calculate_risk_fields(parsed or {})
 
@@ -499,6 +595,10 @@ def _gen_row_for_risk(
     ).strip()
 
     control, _rc_source = _nearest_req_control(requirements, hint)
+    # Prefer explicit model/RAG control if it exists and is not trivial
+    rc_from_model = (parsed.get("Risk Control") or "").strip()
+    if rc_from_model and len(rc_from_model) > 8 and "IEC 60601" not in rc_from_model:
+        control = rc_from_model
 
     return {
         "requirement_id": rid,
@@ -514,9 +614,9 @@ def _gen_row_for_risk(
         "poh": poh,
         "risk_index": risk_index,
         "risk_control": control,
-        # Optional debug fields (comment-out if you must keep schema minimal):
+        # Uncomment if you want quick QA flags:
         # "_rc_source": _rc_source,
-        # "_repaired": parsed != {} and isinstance(parsed, dict),
+        # "_used_rag": parsed is not None and bool(rc_from_model),
     }
 
 
@@ -528,12 +628,15 @@ def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     # If both adapter and merged are disabled, do the quick fallback.
     if not (USE_HA_ADAPTER or USE_HA_MODEL):
+        # still load RAG so risk_control may be less generic if you later enable it
+        _load_rag_db()
         return _fallback_ha(requirements)
 
     # Try to load model once; if it fails, use fallback.
     try:
         _load_model()
     except Exception:
+        _load_rag_db()
         return _fallback_ha(requirements)
 
     out: List[Dict[str, Any]] = []
