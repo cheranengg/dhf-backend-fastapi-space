@@ -5,8 +5,7 @@ from typing import List, Dict, Any, Optional
 
 # --------- ENV / toggles ----------
 USE_DVP_MODEL = os.getenv("USE_DVP_MODEL", "0") == "1"
-DVP_MODEL_DIR = os.getenv("DVP_MODEL_DIR", "cheranengg/dhf-dvp-merged")
-DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "10"))
+DVP_MODEL_DIR = os.getenv("DVP_MODEL_DIR", "cheranengg/dhf-dvp-merged")  # your merged repo
 
 HF_TOKEN = (
     os.getenv("HF_TOKEN")
@@ -18,6 +17,8 @@ CACHE_DIR   = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/h
 FORCE_CPU   = os.getenv("FORCE_CPU", "0") == "1"
 OFFLOAD_DIR = os.getenv("OFFLOAD_DIR", "/tmp/offload")
 MAX_NEW     = int(os.getenv("DVP_MAX_NEW_TOKENS", "300"))
+# Enable CUDA autocast to avoid float32/float16 matmul mismatches
+DVP_AUTOMIXED_PRECISION = os.getenv("DVP_AUTOMIXED_PRECISION", "1") == "1"
 
 def _token_cache_kwargs():
     kw = {"cache_dir": CACHE_DIR}
@@ -31,12 +32,15 @@ VISUAL_KWS    = ["label", "marking", "display", "visual", "color"]
 TECH_KWS      = ["electrical", "mechanical", "flow", "pressure", "occlusion", "accuracy", "alarm"]
 
 TEST_SPEC_LOOKUP = {
+    # IEC 60601-1 (Electrical Safety)
     "insulation": "≥ 50 MΩ at 500 V DC (IEC 60601-1)",
     "leakage":    "≤ 100 µA at rated voltage (IEC 60601-1)",
     "dielectric": "1500 V AC for 1 min, no breakdown (IEC 60601-1)",
     "earth":      "Earth continuity ≤ 0.1 Ω at 25 A for 1 min (IEC 60601-1)",
+    # Infusion pumps
     "flow":       "±5% from set value (IEC 60601-2-24)",
     "occlusion":  "Alarm ≤ 30 s at 100 kPa back pressure (IEC 60601-2-24)",
+    # Connectors / EMC / Env
     "luer":       "No leakage under 300 kPa for 30 s (ISO 80369-7)",
     "emc":        "±6 kV contact, ±8 kV air (IEC 61000-4-2)",
     "vibration":  "10–500 Hz, 0.5 g, 2 h/axis (IEC 60068-2-6)",
@@ -53,6 +57,7 @@ def _get_verification_method(req_text: str) -> str:
     return "Physical Inspection"
 
 def _get_sample_size(requirement_id: str, ha_items: List[Dict[str, Any]]) -> str:
+    """Map to HA severity if provided; else derive from ID for stability."""
     sev = None
     for h in ha_items or []:
         rid = str(h.get("requirement_id") or h.get("Requirement ID") or "")
@@ -76,7 +81,7 @@ _tokenizer: Optional["AutoTokenizer"] = None
 _model: Optional["AutoModelForCausalLM"] = None
 
 def _load_model():
-    """Load ONLY the fine-tuned DVP model; device_map=auto + CPU offload; pad_token fix."""
+    """Load ONLY the fine-tuned DVP model; device_map=auto + optional offload; pad_token fix."""
     global _tokenizer, _model
     if not USE_DVP_MODEL or _model is not None:
         return
@@ -127,6 +132,7 @@ GEN_PROMPT_TMPL = (
 )
 
 def _gen_test_procedure_model(requirement_text: str) -> str:
+    """Generate bullets; handle dtype/device reliably with CUDA autocast."""
     _load_model()
     if _model is None:
         return _gen_test_procedure_stub(requirement_text)
@@ -136,17 +142,34 @@ def _gen_test_procedure_model(requirement_text: str) -> str:
     prompt = GEN_PROMPT_TMPL.format(req=requirement_text or "the feature")
 
     def _run(max_new: int) -> str:
-        inputs = _tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).to(device)  # type: ignore
+        inputs = _tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)  # type: ignore
+        inputs = inputs.to(device)  # ensure same device as model
+
         with torch.no_grad():
-            out = _model.generate(  # type: ignore
-                **inputs,
-                max_new_tokens=max_new,
-                temperature=0.3,
-                do_sample=True,
-                top_p=0.9,
-            )
+            if device == "cuda" and DVP_AUTOMIXED_PRECISION:
+                # Autocast avoids float32/float16 matmul mismatches
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    out = _model.generate(  # type: ignore
+                        **inputs,
+                        max_new_tokens=max_new,
+                        temperature=0.3,
+                        do_sample=True,
+                        top_p=0.9,
+                        use_cache=True,
+                    )
+            else:
+                out = _model.generate(  # type: ignore
+                    **inputs,
+                    max_new_tokens=max_new,
+                    temperature=0.3,
+                    do_sample=True,
+                    top_p=0.9,
+                    use_cache=True,
+                )
+
         text = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
 
+        # Keep just the 3–4 best bullet-ish lines
         bullets = []
         for line in text.split("\n"):
             line = line.strip(" -•\t")
@@ -154,18 +177,20 @@ def _gen_test_procedure_model(requirement_text: str) -> str:
                 bullets.append(f"- {line}")
             if len(bullets) == 4:
                 break
-        if not bullets:
+        cleaned = "\n".join(bullets)
+        if not cleaned:
+            # attempt numbered-steps extraction if bullets absent
             m = re.findall(r"\d+\..{10,}", text)
             bullets = [f"- {s.strip()}" for s in m[:4]]
-        cleaned = "\n".join(bullets) if bullets else "TBD"
+            cleaned = "\n".join(bullets) if bullets else "TBD"
         return cleaned or "TBD"
 
     try:
         return _run(MAX_NEW)
     except RuntimeError as e:
-        if "out of memory" not in str(e).lower():
-            raise
-        _clear_cuda()
+        # OOM or stray dtype problems → clear + retry smaller on CPU
+        if "out of memory" in str(e).lower():
+            _clear_cuda()
         try:
             _model.to("cpu")  # type: ignore
         except Exception:
@@ -189,6 +214,12 @@ def _gen_test_procedure(requirement_text: str) -> str:
 
 # --------- Public API ----------
 def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
+    """
+    Input rows must include:
+      - 'Requirement ID' (or 'requirement_id')
+      - 'Verification ID' (optional passthrough)
+      - 'Requirements'   (main text)
+    """
     _load_model()  # may be no-op if USE_DVP_MODEL=0
 
     rows: List[Dict[str, Any]] = []
@@ -197,34 +228,34 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
         vid = str(r.get("Verification ID") or r.get("verification_id") or "")
         rtxt = str(r.get("Requirements") or r.get("requirements") or "").strip()
 
+        # Section titles like "... Requirements"
         if rtxt.lower().endswith("requirements") and not vid:
             rows.append({
                 "verification_id": vid, "requirement_id": rid, "requirements": rtxt,
                 "verification_method": "NA", "sample_size": "NA",
                 "test_procedure": "NA", "acceptance_criteria": "NA",
             })
-        else:
-            method = _get_verification_method(rtxt)
-            sample = _get_sample_size(rid, ha or [])
-            bullets = _gen_test_procedure(rtxt)
+            continue
 
-            ac = "TBD"
-            low = rtxt.lower()
-            for kw, spec in TEST_SPEC_LOOKUP.items():
-                if kw in low:
-                    ac = spec
-                    break
+        method = _get_verification_method(rtxt)
+        sample = _get_sample_size(rid, ha or [])
 
-            rows.append({
-                "verification_id": vid,
-                "requirement_id": rid,
-                "requirements": rtxt,
-                "verification_method": method or "NA",
-                "sample_size": sample or "NA",
-                "test_procedure": bullets or "TBD",
-                "acceptance_criteria": ac or "TBD",
-            })
+        bullets = _gen_test_procedure(rtxt)
 
-        if len(rows) >= DVP_MAX_ROWS:
-            return rows
-    return rows[:DVP_MAX_ROWS]
+        ac = "TBD"
+        low = rtxt.lower()
+        for kw, spec in TEST_SPEC_LOOKUP.items():
+            if kw in low:
+                ac = spec
+                break
+
+        rows.append({
+            "verification_id": vid,
+            "requirement_id": rid,
+            "requirements": rtxt,
+            "verification_method": method or "NA",
+            "sample_size": sample or "NA",
+            "test_procedure": bullets or "TBD",
+            "acceptance_criteria": ac or "TBD",
+        })
+    return rows
