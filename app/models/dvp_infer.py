@@ -5,7 +5,8 @@ from typing import List, Dict, Any, Optional
 
 # --------- ENV / toggles ----------
 USE_DVP_MODEL = os.getenv("USE_DVP_MODEL", "0") == "1"
-DVP_MODEL_DIR = os.getenv("DVP_MODEL_DIR", "cheranengg/dhf-dvp-merged")  # your merged repo
+DVP_MODEL_DIR = os.getenv("DVP_MODEL_DIR", "cheranengg/dhf-dvp-merged")
+DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "10"))
 
 HF_TOKEN = (
     os.getenv("HF_TOKEN")
@@ -17,7 +18,6 @@ CACHE_DIR   = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/h
 FORCE_CPU   = os.getenv("FORCE_CPU", "0") == "1"
 OFFLOAD_DIR = os.getenv("OFFLOAD_DIR", "/tmp/offload")
 MAX_NEW     = int(os.getenv("DVP_MAX_NEW_TOKENS", "300"))
-DO_SAMPLE   = os.getenv("DVP_DO_SAMPLE", "0") == "1"   # default OFF to avoid NaN prob errors
 
 def _token_cache_kwargs():
     kw = {"cache_dir": CACHE_DIR}
@@ -31,15 +31,12 @@ VISUAL_KWS    = ["label", "marking", "display", "visual", "color"]
 TECH_KWS      = ["electrical", "mechanical", "flow", "pressure", "occlusion", "accuracy", "alarm"]
 
 TEST_SPEC_LOOKUP = {
-    # IEC 60601-1 (Electrical Safety)
     "insulation": "≥ 50 MΩ at 500 V DC (IEC 60601-1)",
     "leakage":    "≤ 100 µA at rated voltage (IEC 60601-1)",
     "dielectric": "1500 V AC for 1 min, no breakdown (IEC 60601-1)",
     "earth":      "Earth continuity ≤ 0.1 Ω at 25 A for 1 min (IEC 60601-1)",
-    # Infusion pumps
     "flow":       "±5% from set value (IEC 60601-2-24)",
     "occlusion":  "Alarm ≤ 30 s at 100 kPa back pressure (IEC 60601-2-24)",
-    # Connectors / EMC / Env
     "luer":       "No leakage under 300 kPa for 30 s (ISO 80369-7)",
     "emc":        "±6 kV contact, ±8 kV air (IEC 61000-4-2)",
     "vibration":  "10–500 Hz, 0.5 g, 2 h/axis (IEC 60068-2-6)",
@@ -56,7 +53,6 @@ def _get_verification_method(req_text: str) -> str:
     return "Physical Inspection"
 
 def _get_sample_size(requirement_id: str, ha_items: List[Dict[str, Any]]) -> str:
-    """Map to HA severity if provided; else derive from ID for stability."""
     sev = None
     for h in ha_items or []:
         rid = str(h.get("requirement_id") or h.get("Requirement ID") or "")
@@ -80,20 +76,21 @@ _tokenizer: Optional["AutoTokenizer"] = None
 _model: Optional["AutoModelForCausalLM"] = None
 
 def _load_model():
-    """Load ONLY the fine-tuned DVP model; device_map=auto + optional offload; pad_token fix."""
+    """Load ONLY the fine-tuned DVP model; device_map=auto + CPU offload; pad_token fix."""
     global _tokenizer, _model
     if not USE_DVP_MODEL or _model is not None:
         return
 
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    import torch
+    import torch, os
 
     dtype = torch.float16 if (torch.cuda.is_available() and not FORCE_CPU) else torch.float32
     device_map = "auto" if (torch.cuda.is_available() and not FORCE_CPU) else None
 
+    # tokenizer from merged repo
     _tokenizer = AutoTokenizer.from_pretrained(DVP_MODEL_DIR, **_token_cache_kwargs())
     if _tokenizer.pad_token is None:
-        _tokenizer.pad_token = _tokenizer.eos_token
+        _tokenizer.pad_token = _tokenizer.eos_token  # prevents pad/eos cuda op during generate
 
     _model = AutoModelForCausalLM.from_pretrained(
         DVP_MODEL_DIR,
@@ -101,11 +98,10 @@ def _load_model():
         low_cpu_mem_usage=True,
         device_map=device_map,
         offload_folder=OFFLOAD_DIR if device_map == "auto" else None,
-        **_token_cache_kwargs(),
+        **_token_cache_kwargs()
     )
-    _model.eval()
     try:
-        _model.config.pad_token_id = _tokenizer.pad_token_id
+        _model.config.pad_token_id = _tokenizer.pad_token_id  # extra guard
     except Exception:
         pass
     if device_map is None:
@@ -131,28 +127,23 @@ GEN_PROMPT_TMPL = (
 )
 
 def _gen_test_procedure_model(requirement_text: str) -> str:
-    """Stable bullet generation; greedy by default to avoid multinomial/NaN issues."""
     _load_model()
     if _model is None:
         return _gen_test_procedure_stub(requirement_text)
 
     import torch, re
-    device = next(_model.parameters()).device  # model's actual device
+    device = "cuda" if (torch.cuda.is_available() and not FORCE_CPU) else "cpu"
     prompt = GEN_PROMPT_TMPL.format(req=requirement_text or "the feature")
 
-    def _run(max_new: int, sample: bool) -> str:
-        inputs = _tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)  # type: ignore
-        inputs = {k: v.to(device) for k, v in inputs.items()}  # align to model device
+    def _run(max_new: int) -> str:
+        inputs = _tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).to(device)  # type: ignore
         with torch.no_grad():
             out = _model.generate(  # type: ignore
                 **inputs,
                 max_new_tokens=max_new,
-                do_sample=sample,
-                temperature=(0.3 if sample else None),
-                top_p=(0.9 if sample else None),
-                num_beams=1,
-                eos_token_id=_tokenizer.eos_token_id,  # extra safety
-                pad_token_id=_tokenizer.pad_token_id,
+                temperature=0.3,
+                do_sample=True,
+                top_p=0.9,
             )
         text = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
 
@@ -163,25 +154,24 @@ def _gen_test_procedure_model(requirement_text: str) -> str:
                 bullets.append(f"- {line}")
             if len(bullets) == 4:
                 break
-
         if not bullets:
             m = re.findall(r"\d+\..{10,}", text)
             bullets = [f"- {s.strip()}" for s in m[:4]]
-
-        return "\n".join(bullets) if bullets else "TBD"
+        cleaned = "\n".join(bullets) if bullets else "TBD"
+        return cleaned or "TBD"
 
     try:
-        # First try (greedy by default unless DVP_DO_SAMPLE=1)
-        return _run(MAX_NEW, DO_SAMPLE)
+        return _run(MAX_NEW)
     except RuntimeError as e:
-        # Retry path for any numeric/device problem
+        if "out of memory" not in str(e).lower():
+            raise
         _clear_cuda()
         try:
             _model.to("cpu")  # type: ignore
         except Exception:
             pass
         try:
-            return _run(min(160, MAX_NEW), False)  # force greedy on CPU
+            return _run(min(160, MAX_NEW))
         except Exception:
             return "TBD"
 
@@ -199,12 +189,6 @@ def _gen_test_procedure(requirement_text: str) -> str:
 
 # --------- Public API ----------
 def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
-    """
-    Input rows must include:
-      - 'Requirement ID' (or 'requirement_id')
-      - 'Verification ID' (optional passthrough)
-      - 'Requirements'   (main text)
-    """
     _load_model()  # may be no-op if USE_DVP_MODEL=0
 
     rows: List[Dict[str, Any]] = []
@@ -219,26 +203,28 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]):
                 "verification_method": "NA", "sample_size": "NA",
                 "test_procedure": "NA", "acceptance_criteria": "NA",
             })
-            continue
+        else:
+            method = _get_verification_method(rtxt)
+            sample = _get_sample_size(rid, ha or [])
+            bullets = _gen_test_procedure(rtxt)
 
-        method = _get_verification_method(rtxt)
-        sample = _get_sample_size(rid, ha or [])
-        bullets = _gen_test_procedure(rtxt)
+            ac = "TBD"
+            low = rtxt.lower()
+            for kw, spec in TEST_SPEC_LOOKUP.items():
+                if kw in low:
+                    ac = spec
+                    break
 
-        ac = "TBD"
-        low = rtxt.lower()
-        for kw, spec in TEST_SPEC_LOOKUP.items():
-            if kw in low:
-                ac = spec
-                break
+            rows.append({
+                "verification_id": vid,
+                "requirement_id": rid,
+                "requirements": rtxt,
+                "verification_method": method or "NA",
+                "sample_size": sample or "NA",
+                "test_procedure": bullets or "TBD",
+                "acceptance_criteria": ac or "TBD",
+            })
 
-        rows.append({
-            "verification_id": vid,
-            "requirement_id": rid,
-            "requirements": rtxt,
-            "verification_method": method or "NA",
-            "sample_size": sample or "NA",
-            "test_procedure": bullets or "TBD",
-            "acceptance_criteria": ac or "TBD",
-        })
-    return rows
+        if len(rows) >= DVP_MAX_ROWS:
+            return rows
+    return rows[:DVP_MAX_ROWS]
