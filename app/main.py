@@ -8,23 +8,18 @@ from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # Optional startup hook to clear HF cache (/tmp/hf) each boot.
-try:  # noqa: SIM105
-    import startup_cleanup  # type: ignore  # noqa: F401
+try:
+    import startup_cleanup  # noqa: F401
 except Exception:
     pass
 
-# Model modules (from app/models/*_infer.py)
-from app.models import ha_infer, dvp_infer, tm_infer  # noqa: E402
+# Import model modules
+from app.models import ha_infer  # we'll add dvp_infer later when you flip it on
 
 # -------------------------------------------------------------------
 # Auth / App setup
 # -------------------------------------------------------------------
 BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "devtoken")
-
-# Soft row caps (modules already cap, but we keep here for consistency)
-HA_MAX_ROWS = int(os.getenv("HA_MAX_ROWS", "10"))
-DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "10"))
-TM_MAX_ROWS = int(os.getenv("TM_MAX_ROWS", "10"))
 
 app = FastAPI(title="DHF Backend")
 
@@ -51,7 +46,15 @@ def _auth(authorization: str | None):
 # -------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    # Quick peek at HA env for debugging
+    return {
+        "ok": True,
+        "USE_HA_MODEL": os.getenv("USE_HA_MODEL"),
+        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID"),
+        "HA_ADAPTER_REPO": os.getenv("HA_ADAPTER_REPO"),
+        "LOAD_4BIT": os.getenv("LOAD_4BIT"),
+        "FORCE_CPU": os.getenv("FORCE_CPU"),
+    }
 
 
 @app.post("/hazard-analysis")
@@ -71,56 +74,13 @@ def hazard_endpoint(
     _auth(authorization)
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
+        # optional truncation for speed: keep first N requirements
+        max_req = int(os.getenv("MAX_REQS", "10"))
+        reqs = reqs[:max_req]
         ha_rows = ha_infer.ha_predict(reqs)
-        return {"ok": True, "ha": ha_rows[:HA_MAX_ROWS]}
+        return {"ok": True, "ha": ha_rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"HA failed: {e}")
-
-
-@app.post("/dvp")
-def dvp_endpoint(
-    payload: Dict[str, Any] = Body(...),
-    authorization: str | None = Header(default=None),
-):
-    """
-    Request body:
-    {
-      "requirements": [...],   # same shape as hazard-analysis
-      "ha": [...]              # output from hazard-analysis (optional but helpful)
-    }
-    """
-    _auth(authorization)
-    try:
-        reqs: List[Dict[str, Any]] = payload.get("requirements") or []
-        ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
-        dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)
-        return {"ok": True, "dvp": dvp_rows[:DVP_MAX_ROWS]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DVP failed: {e}")
-
-
-@app.post("/tm")
-def tm_endpoint(
-    payload: Dict[str, Any] = Body(...),
-    authorization: str | None = Header(default=None),
-):
-    """
-    Request body:
-    {
-      "requirements": [...],
-      "ha": [...],
-      "dvp": [...]
-    }
-    """
-    _auth(authorization)
-    try:
-        reqs: List[Dict[str, Any]] = payload.get("requirements") or []
-        ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
-        dvp_rows: List[Dict[str, Any]] = payload.get("dvp") or []
-        tm_rows = tm_infer.tm_predict(reqs, ha_rows, dvp_rows)
-        return {"ok": True, "tm": tm_rows[:TM_MAX_ROWS]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TM failed: {e}")
 
 
 @app.post("/debug/smoke")
@@ -128,27 +88,21 @@ def debug_smoke(
     authorization: str | None = Header(default=None),
 ):
     """
-    Quick smoke test that runs HA, DVP, and TM on a tiny synthetic requirement set.
+    Quick smoke test that runs HA on a few synthetic requirements.
     """
     _auth(authorization)
     reqs = [
         {
             "Requirement ID": "REQ-001",
-            "Requirements": "Pump shall maintain flow accuracy within ±5%.",
+            "Requirements": "The pump shall maintain flow accuracy within ±5% from set value across 0.1–999 ml/hr.",
         },
         {
             "Requirement ID": "REQ-002",
             "Requirements": "Device labeling shall be legible at 30 cm and use ISO 15223-1 symbols.",
         },
-        {
-            "Requirement ID": "REQ-003",
-            "Requirements": "Electrical insulation shall comply with IEC 60601-1 dielectric strength requirements.",
-        },
     ]
     try:
-        ha_rows = ha_infer.ha_predict(reqs)[:HA_MAX_ROWS]
-        dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)[:DVP_MAX_ROWS]
-        tm_rows = tm_infer.tm_predict(reqs, ha_rows, dvp_rows)[:TM_MAX_ROWS]
-        return {"ok": True, "ha": ha_rows, "dvp": dvp_rows, "tm": tm_rows}
+        ha_rows = ha_infer.ha_predict(reqs)
+        return {"ok": True, "ha": ha_rows}
     except Exception as e:
         return {"ok": False, "error": str(e)}
