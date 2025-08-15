@@ -20,8 +20,9 @@ ENABLE_TM  = os.getenv("ENABLE_TM",  "0") == "1"  # start disabled until ready
 MAX_REQS   = int(os.getenv("MAX_REQS", "10"))
 
 # Import model modules
-from app.models import ha_infer  # <- uses infer_ha()
-# DVP/TM are optional modules in your repo; import defensively
+from app.models import ha_infer  # HA adapter-only infer_ha()
+
+# DVP/TM are optional; import defensively
 _dvp_available = False
 try:
     from app.models import dvp_infer  # type: ignore
@@ -71,7 +72,7 @@ def _limit_requirements(reqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # -------------------------------------------------------------------
-# Endpoints
+# Health / Debug
 # -------------------------------------------------------------------
 @app.get("/health")
 def health():
@@ -86,7 +87,7 @@ def health():
 
 @app.get("/debug/ha_status")
 def debug_ha_status():
-    """Adapter-only status + RAG + MAUDE visibility."""
+    """Adapter-only HA status + RAG + MAUDE visibility."""
     rag_rows = len(getattr(ha_infer, "_RAG_DB", []) or [])
     return {
         "adapter_enabled": bool(os.getenv("USE_HA_ADAPTER", "1") == "1"),
@@ -102,6 +103,30 @@ def debug_ha_status():
     }
 
 
+@app.get("/debug/dvp_status")
+def debug_dvp_status():
+    """DVP adapter + retrieval/Serper flags for quick inspection."""
+    return {
+        "dvp_available": _dvp_available,
+        "adapter_enabled": os.getenv("USE_DVP_ADAPTER", "1") == "1",
+        "adapter_repo": os.getenv("DVP_ADAPTER_REPO", "cheranengg/dhf-dvp-adapter"),
+        "base_model": os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
+        "retrieval_enabled": os.getenv("ENABLE_DVP_RETRIEVAL", "1") == "1",
+        "serper_key_present": bool(os.getenv("SERPER_API_KEY", "")),
+        "gen": {
+            "max_new_tokens": int(os.getenv("DVP_MAX_NEW_TOKENS", "320")),
+            "temperature": float(os.getenv("DVP_TEMPERATURE", "0.3")),
+            "top_p": float(os.getenv("DVP_TOP_P", "0.9")),
+            "do_sample": os.getenv("DVP_DO_SAMPLE", "1") == "1",
+            "num_beams": int(os.getenv("DVP_NUM_BEAMS", "1")),
+            "repetition_penalty": float(os.getenv("DVP_REPETITION_PENALTY", "1.05")),
+        },
+    }
+
+
+# -------------------------------------------------------------------
+# Endpoints
+# -------------------------------------------------------------------
 @app.post("/hazard-analysis")
 def hazard_endpoint(
     request: Request,
