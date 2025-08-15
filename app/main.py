@@ -82,6 +82,7 @@ def health():
 def debug_ha_status():
     """Adapter-only status + RAG visibility."""
     rag_path = getattr(ha_infer, "RAG_SYNTHETIC_PATH", "")
+    maude_path = getattr(ha_infer, "RAG_MAUDE_PATH", "")
     return {
         "adapter_enabled": getattr(ha_infer, "USE_HA_ADAPTER", False),
         "adapter_repo": getattr(ha_infer, "HA_ADAPTER_REPO", None),
@@ -89,6 +90,9 @@ def debug_ha_status():
         "rag_path": rag_path,
         "rag_file_exists": os.path.exists(rag_path) if rag_path else False,
         "rag_rows_loaded": len(getattr(ha_infer, "_RAG_DB", [])),
+        "maude_path": maude_path,
+        "maude_file_exists": os.path.exists(maude_path) if maude_path else False,
+        "maude_rows_loaded": len(getattr(ha_infer, "_MAUDE_DB", [])),
     }
 
 
@@ -122,6 +126,8 @@ def hazard_endpoint(
                 "base_model": getattr(ha_infer, "BASE_MODEL_ID", None),
                 "rag_path": getattr(ha_infer, "RAG_SYNTHETIC_PATH", None),
                 "rag_rows": len(getattr(ha_infer, "_RAG_DB", [])),
+                "maude_path": getattr(ha_infer, "RAG_MAUDE_PATH", None),
+                "maude_rows": len(getattr(ha_infer, "_MAUDE_DB", [])),
                 "n_rows": len(ha_rows),
             }
 
@@ -140,6 +146,8 @@ def hazard_endpoint(
                 "base_model": getattr(ha_infer, "BASE_MODEL_ID", None),
                 "rag_path": getattr(ha_infer, "RAG_SYNTHETIC_PATH", None),
                 "rag_rows": len(getattr(ha_infer, "_RAG_DB", [])),
+                "maude_path": getattr(ha_infer, "RAG_MAUDE_PATH", None),
+                "maude_rows": len(getattr(ha_infer, "_MAUDE_DB", [])),
             })
             return {"ok": False, "ha": [], "diag": diag}
         raise HTTPException(status_code=500, detail=f"HA failed: {e}")
@@ -196,7 +204,7 @@ def _tm_handler(
         if _tm_available and hasattr(tm_infer, "tm_predict"):
             tm_rows = tm_infer.tm_predict(reqs, ha_rows, dvp_rows)  # type: ignore
         else:
-            # lightweight fallback row (no model): prevents 404s in UI
+            # lightweight fallback row (no model)
             from collections import defaultdict
 
             ha_by_req = defaultdict(list)
@@ -278,7 +286,7 @@ def debug_smoke(
     _auth(authorization)
     reqs = [
         {"Requirement ID": "REQ-001", "Verification ID": "VER-001",
-         "Requirements": "The pump shall maintain flow accuracy within ±5% from set value."},
+         "Requirements": "The pump shall maintain flow accuracy within +/- 5% from set value."},
         {"Requirement ID": "REQ-002", "Verification ID": "VER-002",
          "Requirements": "Labeling shall be legible at 30 cm and use ISO 15223-1 symbols."},
     ]
