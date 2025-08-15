@@ -6,20 +6,32 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-# ----------------- runtime switches & locations -----------------
+# =========================
+# Env switches & locations
+# =========================
+
+# Prefer adapter if available
+USE_HA_ADAPTER = os.getenv("USE_HA_ADAPTER", "0") == "1"
+HA_ADAPTER_REPO = os.getenv("HA_ADAPTER_REPO", "")  # e.g., "cheranengg/dhf-ha-adapter"
+
+# Fallback to merged model if enabled
 USE_HA_MODEL = os.getenv("USE_HA_MODEL", "0") == "1"
+HA_MODEL_DIR = os.getenv("HA_MODEL_MERGED_DIR", os.getenv("HA_MODEL_DIR", ""))
 
-# PEFT (adapter) strategy:
-#   - we always load the base model (Mistral) + your fine-tuned adapter from HF
-#   - no merging; you run exactly what trained well in Colab
+# Base model tokenizer (and for adapter base weights)
 BASE_MODEL_ID = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
-HA_ADAPTER_REPO = os.getenv("HA_ADAPTER_REPO", "")  # e.g. "cheranengg/dhf-ha-adapter"
 
-# performance / device knobs
+# Generation knobs
+HA_MAX_NEW_TOKENS = int(os.getenv("HA_MAX_NEW_TOKENS", "256"))
+DO_SAMPLE = os.getenv("do_sample", "1") == "1"
+NUM_BEAMS = int(os.getenv("NUM_BEAMS", "1"))
+
+# Device/loading
 FORCE_CPU = os.getenv("FORCE_CPU", "0") == "1"
-LOAD_4BIT = os.getenv("LOAD_4BIT", "1") == "1"  # keep memory small on L4
+LOAD_4BIT = os.getenv("LOAD_4BIT", "0") == "1"
+OFFLOAD_DIR = os.getenv("OFFLOAD_DIR", "/tmp/offload")
 
-# --- cache & auth helpers ---
+# HF auth/cache
 HF_TOKEN = (
     os.getenv("HF_TOKEN")
     or os.getenv("HUGGING_FACE_HUB_TOKEN")
@@ -36,7 +48,9 @@ def _token_cache_kwargs() -> Dict[str, Any]:
     return kw
 
 
-# ----------------- optional embeddings (best-effort) ---------------
+# =========================
+# Optional embeddings (best-effort)
+# =========================
 _HAS_EMB = False
 try:
     from sentence_transformers import SentenceTransformer  # type: ignore
@@ -45,86 +59,152 @@ try:
 except Exception:
     _HAS_EMB = False
 
-# ----------------- model state -----------------------------------
+
+# =========================
+# Transformers guarded
+# =========================
 _tokenizer = None  # type: ignore
 _model = None  # type: ignore
-_device = "cpu"
+_DEVICE = "cpu"
 _emb: Optional["SentenceTransformer"] = None  # type: ignore
 
 
-def _ensure_model():
+def _load_tokenizer():
     """
-    Load base Mistral + your LoRA adapter (no merge).
-    Uses slow tokenizer (SentencePiece) so protobuf isn't needed.
-    Uses 4-bit quant on GPU if LOAD_4BIT=1 (recommended on HF Spaces L4).
+    Tokenizer rules:
+      - If using LoRA adapter, always load tokenizer from BASE_MODEL_ID.
+      - Else, use HA_MODEL_DIR (merged) if set; fallback to BASE_MODEL_ID.
+      - Prefer slow tokenizer to avoid protobuf dependency; set legacy=True when possible.
+      - Fall back to fast tokenizer if slow fails.
     """
-    global _tokenizer, _model, _device, _emb
+    global _tokenizer
+    from transformers import AutoTokenizer
+
+    if _tokenizer is not None:
+        return _tokenizer
+
+    src = BASE_MODEL_ID if USE_HA_ADAPTER else (HA_MODEL_DIR or BASE_MODEL_ID)
+    last_exc: Optional[Exception] = None
+
+    # slow tokenizer first
+    try:
+        tok = AutoTokenizer.from_pretrained(src, use_fast=False, **_token_cache_kwargs())
+        try:
+            tok.legacy = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        _tokenizer = tok
+        return _tokenizer
+    except Exception as e:
+        last_exc = e
+
+    # fast tokenizer fallback
+    try:
+        tok = AutoTokenizer.from_pretrained(src, use_fast=True, **_token_cache_kwargs())
+        _tokenizer = tok
+        return _tokenizer
+    except Exception as e:
+        last_exc = e
+        raise RuntimeError(f"HA tokenizer load failed from {src}: {last_exc}")
+
+
+def _load_model():
+    """
+    Load HA model:
+      - If USE_HA_ADAPTER=1: load BASE model and attach LoRA adapter (HA_ADAPTER_REPO).
+      - elif USE_HA_MODEL=1: load merged model from HA_MODEL_DIR.
+      - else: leave _model=None (template-only fallback path).
+    Also initializes MiniLM embeddings (best-effort) for requirement proximity.
+    """
+    global _model, _DEVICE, _emb
 
     if _model is not None:
         return
 
-    if not USE_HA_MODEL:
-        # generation is disabled – do not try to load a model
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    # If neither adapter nor merged path is enabled, bail early.
+    if not (USE_HA_ADAPTER or USE_HA_MODEL):
+        _init_embeddings()
         return
 
-    if not HA_ADAPTER_REPO:
-        raise RuntimeError("HA_ADAPTER_REPO is not set. Example: cheranengg/dhf-ha-adapter")
+    tok = _load_tokenizer()
+    want_cuda = torch.cuda.is_available() and not FORCE_CPU
+    dtype = torch.float16 if want_cuda else torch.float32
 
-    from transformers import (
-        AutoTokenizer,
-        AutoModelForCausalLM,
-        BitsAndBytesConfig,
-    )
-    from peft import PeftModel
-    import torch
+    if USE_HA_ADAPTER:
+        # Try to use your helper if present; otherwise direct PEFT load.
+        try:
+            try:
+                # Optional helper (your repo already has this)
+                from ._peft_loader import load_peft_model  # type: ignore
 
-    # slow tokenizer -> avoids protobuf dependency
-    _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=False, **_token_cache_kwargs())
-    if _tokenizer.pad_token is None:
-        _tokenizer.pad_token = _tokenizer.eos_token
+                _model = load_peft_model(
+                    base_model_id=BASE_MODEL_ID,
+                    adapter_id=HA_ADAPTER_REPO,
+                    load_4bit=LOAD_4BIT,
+                    offload_dir=OFFLOAD_DIR,
+                    torch_dtype=dtype,
+                    token_kwargs=_token_cache_kwargs(),
+                )
+            except Exception:
+                # Direct PEFT path
+                from peft import PeftModel
 
-    want_cuda = torch.cuda.is_available() and (not FORCE_CPU)
-    _device = "cuda" if want_cuda else "cpu"
+                base = AutoModelForCausalLM.from_pretrained(
+                    BASE_MODEL_ID,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    **_token_cache_kwargs(),
+                )
+                _model = PeftModel.from_pretrained(base, HA_ADAPTER_REPO, **_token_cache_kwargs())
+        except Exception as e:
+            raise RuntimeError(f"Failed to load HA adapter '{HA_ADAPTER_REPO}': {e}")
 
-    quant_cfg = None
-    dtype = torch.float16 if (want_cuda and not LOAD_4BIT) else None
-
-    if want_cuda and LOAD_4BIT:
-        quant_cfg = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
+    elif USE_HA_MODEL:
+        if not HA_MODEL_DIR:
+            raise RuntimeError("HA model path is not configured (HA_MODEL_MERGED_DIR).")
+        _model = AutoModelForCausalLM.from_pretrained(
+            HA_MODEL_DIR,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            **_token_cache_kwargs(),
         )
 
-    base = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_ID,
-        device_map="auto" if want_cuda else None,
-        torch_dtype=dtype,
-        quantization_config=quant_cfg,
-        low_cpu_mem_usage=True,
-        **_token_cache_kwargs(),
-    )
+    # pad token safety
+    if getattr(tok, "pad_token", None) is None:
+        tok.pad_token = tok.eos_token  # type: ignore[attr-defined]
 
-    _model = PeftModel.from_pretrained(base, HA_ADAPTER_REPO, **_token_cache_kwargs())
-    if not want_cuda:
-        _model.to("cpu")
+    _DEVICE = "cuda" if want_cuda else "cpu"
+    if _model is not None:
+        if want_cuda:
+            _model.to("cuda")
+        else:
+            _model.to("cpu")
+        _model.eval()
 
-    # extra guard
+    _init_embeddings()
+
+
+def _init_embeddings():
+    """Optional MiniLM embeddings for 'nearest requirement' control text."""
+    global _emb
+    if not _HAS_EMB:
+        _emb = None
+        return
+    if _emb is not None:
+        return
     try:
-        _model.config.pad_token_id = _tokenizer.pad_token_id  # type: ignore
+        _emb = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", cache_folder=CACHE_DIR)  # type: ignore
     except Exception:
-        pass
-
-    # embeddings (best-effort, optional)
-    if _HAS_EMB:
-        try:
-            _emb = SentenceTransformer("all-MiniLM-L6-v2", cache_folder=CACHE_DIR)  # type: ignore
-        except Exception:
-            _emb = None
+        _emb = None
 
 
-# ----------------- utilities --------------------------------------
+# =========================
+# Utilities
+# =========================
+
 _default_risks = [
     "Air Embolism",
     "Allergic response",
@@ -167,7 +247,6 @@ def _balanced_json_block(text: str) -> Optional[str]:
     if not candidates:
         return None
 
-    # choose the last (most recent) candidate
     start, end = candidates[-1]
     return text[start:end]
 
@@ -176,7 +255,7 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     js = _balanced_json_block(text)
     if not js:
         return None
-    # light cleanup
+    # cleanup
     js = js.replace("'", '"').replace("\\n", " ")
     js = re.sub(r"\s+", " ", js)
     js = re.sub(r",\s*\}", "}", js)
@@ -220,7 +299,7 @@ def _calculate_risk_fields(parsed: Dict[str, Any]) -> Tuple[int, str, str, str, 
 
 
 def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
-    """Nearest textual requirement (optional embeddings)."""
+    """Find the nearest textual requirement (optional embeddings)."""
     if not _HAS_EMB or _emb is None:
         return "Refer to IEC 60601 and ISO 14971 risk controls"
     try:
@@ -239,7 +318,10 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
         return "Refer to IEC 60601 and ISO 14971 risk controls"
 
 
-# ----------------- prompting --------------------------------------
+# =========================
+# Prompting
+# =========================
+
 _PROMPT = """You are generating Hazard Analysis content for an infusion pump.
 Return ONLY one JSON object with the exact keys:
 {{
@@ -257,28 +339,35 @@ Risk to Health: {risk}
 
 
 def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
-    _ensure_model()
+    _load_model()
     if _model is None or _tokenizer is None:
-        # If the model couldn't load (disabled or error), return empty dict
         return {}
 
     import torch
 
     prompt = _PROMPT.format(risk=risk)
-    inputs = _tokenizer(prompt, return_tensors="pt").to(_device)  # type: ignore
+    inputs = _tokenizer(prompt, return_tensors="pt").to(_DEVICE)  # type: ignore
+
+    gen_kwargs: Dict[str, Any] = dict(
+        max_new_tokens=HA_MAX_NEW_TOKENS,
+        temperature=0.3,
+        top_p=0.9,
+    )
+    if NUM_BEAMS > 1 and not DO_SAMPLE:
+        gen_kwargs.update(dict(num_beams=NUM_BEAMS, do_sample=False))
+    else:
+        gen_kwargs.update(dict(do_sample=True))
+
     with torch.no_grad():
-        out = _model.generate(  # type: ignore
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.2,
-            do_sample=True,
-            top_p=0.9,
-        )
+        out = _model.generate(**inputs, **gen_kwargs)  # type: ignore
     decoded = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
     return _extract_json(decoded) or {}
 
 
-# ----------------- public API --------------------------------------
+# =========================
+# Public API
+# =========================
+
 def _fallback_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for r in requirements:
@@ -308,14 +397,18 @@ def _gen_row_for_risk(
     requirements: List[Dict[str, Any]], risk: str, rid: str
 ) -> Dict[str, Any]:
     parsed: Dict[str, Any] = {}
-    if USE_HA_MODEL:
+    if USE_HA_ADAPTER or USE_HA_MODEL:
         try:
             parsed = _gen_json_for_risk(risk)
         except Exception:
             parsed = {}
 
     severity, p0, p1, poh, risk_index = _calculate_risk_fields(parsed or {})
-    hint = ((parsed.get("Hazardous Situation", "") or "") + " " + (parsed.get("Harm", "") or "")).strip()
+    hint = (
+        (parsed.get("Hazardous Situation", "") or "")
+        + " "
+        + (parsed.get("Harm", "") or "")
+    ).strip()
     control = _nearest_req_control(requirements, hint)
 
     return {
@@ -338,29 +431,26 @@ def _gen_row_for_risk(
 def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     requirements: list of dicts with keys "Requirement ID" and "Requirements".
-    Returns list of HA rows (dicts) – either generated (if USE_HA_MODEL=1)
-    or stable fallback rows.
+    Returns list of HA rows (dicts) – using adapter/merged model if enabled,
+    otherwise stable fallback rows.
     """
-    # If generation is disabled entirely, do the quick fallback.
-    if not USE_HA_MODEL:
+    # If both adapter and merged are disabled, do the quick fallback.
+    if not (USE_HA_ADAPTER or USE_HA_MODEL):
         return _fallback_ha(requirements)
 
-    # Try to warm-load model once; if it fails, use fallback.
+    # Try to load model once; if it fails, use fallback.
     try:
-        _ensure_model()
+        _load_model()
     except Exception:
         return _fallback_ha(requirements)
 
     out: List[Dict[str, Any]] = []
     for r in requirements:
         rid = str(r.get("Requirement ID") or "")
-        # Keep it at 10 risks for speed unless overridden by env
-        risks = _default_risks[: int(os.getenv("HA_RISKS_LIMIT", "10"))]
-        for risk in risks:
+        for risk in _default_risks:
             try:
                 row = _gen_row_for_risk(requirements, risk, rid)
             except Exception:
-                # row-level safety: never abort the whole request
                 row = _gen_row_for_risk([], risk, rid)
             out.append(row)
     return out
