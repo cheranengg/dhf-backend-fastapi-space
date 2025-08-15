@@ -1,12 +1,8 @@
 # app/models/ha_infer.py
 from __future__ import annotations
 
-import os
-import json
-import re
-import time
+import os, re, json, time
 from typing import Any, Dict, List, Optional, Tuple
-
 import requests
 import numpy as np
 
@@ -18,14 +14,14 @@ HA_ADAPTER_REPO = os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter")
 BASE_MODEL_ID = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
 
 # Generation knobs
-HA_MAX_NEW_TOKENS = int(os.getenv("HA_MAX_NEW_TOKENS", "256"))
-DO_SAMPLE = os.getenv("DO_SAMPLE", os.getenv("do_sample", "0")) == "1"
-NUM_BEAMS = int(os.getenv("NUM_BEAMS", "1"))
-TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
-TOP_P = float(os.getenv("TOP_P", "0.9"))
-REPETITION_PENALTY = float(os.getenv("REPETITION_PENALTY", "1.05"))
+HA_MAX_NEW_TOKENS     = int(os.getenv("HA_MAX_NEW_TOKENS", "256"))
+DO_SAMPLE             = os.getenv("DO_SAMPLE", os.getenv("do_sample", "0")) == "1"
+NUM_BEAMS             = int(os.getenv("NUM_BEAMS", "1"))
+TEMPERATURE           = float(os.getenv("TEMPERATURE", "0.2"))
+TOP_P                 = float(os.getenv("TOP_P", "0.9"))
+REPETITION_PENALTY    = float(os.getenv("REPETITION_PENALTY", "1.05"))
 
-# Cache / auth
+# HF cache/auth
 FORCE_CPU = os.getenv("FORCE_CPU", "0") == "1"
 HF_TOKEN = (
     os.getenv("HF_TOKEN")
@@ -40,7 +36,6 @@ CACHE_DIR = (
     or os.getenv("HF_HUB_CACHE")
     or "/tmp/hf"
 )
-
 def _token_cache_kwargs() -> Dict[str, Any]:
     kw: Dict[str, Any] = {"cache_dir": CACHE_DIR}
     if HF_TOKEN:
@@ -48,7 +43,7 @@ def _token_cache_kwargs() -> Dict[str, Any]:
     return kw
 
 # =========================
-# Optional embeddings
+# Optional embeddings (MiniLM) for nearest requirement & similarity checks
 # =========================
 _HAS_EMB = False
 try:
@@ -56,32 +51,36 @@ try:
     _HAS_EMB = True
 except Exception:
     _HAS_EMB = False
-
-_emb = None  # sentence-transformers model or None
-
+_emb = None   # sentence-transformers model or None
 
 # =========================
-# Model globals
+# Globals for model & tokenizer
 # =========================
 _tokenizer = None  # type: ignore
 _model = None      # type: ignore
 
 # =========================
-# RAG (synthetic) store
+# Synthetic RAG
 # =========================
 RAG_SYNTHETIC_PATH = os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl")
-_RAG_DB: List[Dict[str, Any]] = []
-_RAG_TEXTS: List[str] = []
-_RAG_EMB = None  # sentence-transformers for RAG, if available
+_RAG_DB: List[Dict[str, Any]] = []   # list of canonicalized dicts
+_RAG_TEXTS: List[str] = []           # concatenated text for similarity
 
 # =========================
-# MAUDE live fetch settings
+# MAUDE live fetch
 # =========================
-MAUDE_FETCH = os.getenv("MAUDE_FETCH", "0") == "1"
-MAUDE_DEVICE = os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM")
-MAUDE_LIMIT = int(os.getenv("MAUDE_LIMIT", "20"))
-MAUDE_TTL   = int(os.getenv("MAUDE_TTL", "86400"))
+MAUDE_FETCH     = os.getenv("MAUDE_FETCH", "0") == "1"
+MAUDE_DEVICE    = os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM")
+MAUDE_LIMIT     = int(os.getenv("MAUDE_LIMIT", "20"))
+MAUDE_TTL       = int(os.getenv("MAUDE_TTL", "86400"))
 MAUDE_CACHE_DIR = os.getenv("MAUDE_CACHE_DIR", "/tmp/maude_cache")
+
+# =========================
+# Anti-copy (paraphrase) controls
+# =========================
+PARAPHRASE_FROM_RAG   = os.getenv("PARAPHRASE_FROM_RAG", "1") == "1"
+SIM_THRESHOLD         = float(os.getenv("SIM_THRESHOLD", "0.92"))
+PARAPHRASE_MAX_WORDS  = int(os.getenv("PARAPHRASE_MAX_WORDS", "20"))
 
 # =========================
 # Default risks per requirement
@@ -92,7 +91,7 @@ _DEFAULT_RISKS = [
 ]
 
 # =========================
-# Tokenizer / Model loaders
+# Tokenizer / Model loaders (adapter-only)
 # =========================
 def _load_tokenizer():
     global _tokenizer
@@ -112,21 +111,16 @@ def _load_tokenizer():
         _tokenizer.pad_token = _tokenizer.eos_token  # type: ignore[attr-defined]
     return _tokenizer
 
-
 def _init_embeddings():
-    global _emb, _RAG_EMB
+    global _emb
     if not _HAS_EMB:
         _emb = None
-        _RAG_EMB = None
         return
     if _emb is None:
         try:
             _emb = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", cache_folder=CACHE_DIR)  # type: ignore
         except Exception:
             _emb = None
-    if _RAG_EMB is None:
-        _RAG_EMB = _emb
-
 
 def _load_model():
     """Adapter-only, device_map='auto'."""
@@ -136,7 +130,6 @@ def _load_model():
     import torch
     from transformers import AutoModelForCausalLM
     from peft import PeftModel
-
     base = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
         torch_dtype=torch.float16 if (torch.cuda.is_available() and not FORCE_CPU) else torch.float32,
@@ -148,9 +141,8 @@ def _load_model():
     _init_embeddings()
     _load_rag_db()
 
-
 # =========================
-# RAG synthetic loader
+# Synthetic RAG loader
 # =========================
 _CANON_KEYS = {
     "risk id": "Risk ID",
@@ -167,7 +159,6 @@ _CANON_KEYS = {
     "risk index": "Risk Index",
     "risk control": "Risk Control",
 }
-
 def _canon_record_keys(rec: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in rec.items():
@@ -176,7 +167,6 @@ def _canon_record_keys(rec: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in list(out.items()):
         if isinstance(v, str):
             out[k] = v.strip()
-    # normalize severity (S1..S4 if numeric)
     sev = out.get("Severity of Harm")
     if isinstance(sev, (int, float)) or (isinstance(sev, str) and sev.isdigit()):
         n = max(1, min(4, int(sev)))
@@ -198,7 +188,7 @@ def _load_rag_db():
                         rec = json.loads(line)
                     except Exception:
                         try:
-                            import json5  # type: ignore
+                            import json5  # optional
                             rec = json5.loads(line)
                         except Exception:
                             continue
@@ -224,12 +214,10 @@ def _load_rag_db():
 def _balanced_json_block(text: str) -> Optional[str]:
     if not text:
         return None
-    depth = 0
-    start = -1
+    depth, start = 0, -1
     for i, ch in enumerate(text):
         if ch == "{":
-            if depth == 0:
-                start = i
+            if depth == 0: start = i
             depth += 1
         elif ch == "}":
             if depth > 0:
@@ -248,7 +236,7 @@ def _repair_json_str(js: str) -> Optional[Dict[str, Any]]:
         return json.loads(s)
     except Exception:
         try:
-            import json5  # type: ignore
+            import json5  # optional
             return json5.loads(s)
         except Exception:
             return None
@@ -260,25 +248,25 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
 # =========================
 # Enums / scoring
 # =========================
-_SEV_NUM = {"S1": 1, "S2": 2, "S3": 3, "S4": 4}
+_SEV_NUM = {"S1":1,"S2":2,"S3":3,"S4":4}
 _P_CANON = {
-    "VERY LOW": "Very Low", "VL": "Very Low", "0": "Very Low",
-    "LOW": "Low", "L": "Low", "1": "Low",
-    "MEDIUM": "Medium", "MID": "Medium", "M": "Medium", "2": "Medium",
-    "HIGH": "High", "H": "High", "3": "High",
-    "VERY HIGH": "Very High", "VH": "Very High", "4": "Very High",
+    "VERY LOW":"Very Low","VL":"Very Low","0":"Very Low",
+    "LOW":"Low","L":"Low","1":"Low",
+    "MEDIUM":"Medium","MID":"Medium","M":"Medium","2":"Medium",
+    "HIGH":"High","H":"High","3":"High",
+    "VERY HIGH":"Very High","VH":"Very High","4":"Very High",
 }
 def _canon_sev(v: Any, default="S3") -> str:
     s = str(v or "").strip().upper()
-    if s.isdigit(): return f"S{max(1, min(4, int(s)))}"
+    if s.isdigit(): return f"S{max(1,min(4,int(s)))}"
     if s in _SEV_NUM: return s
     return default
 def _canon_p(v: Any, default="Medium") -> str:
     return _P_CANON.get((str(v or "")).strip().upper(), default)
 
-def _calculate_risk_fields(parsed: Dict[str, Any]) -> Tuple[int, str, str, str, str]:
+def _calculate_risk_fields(parsed: Dict[str, Any]) -> Tuple[int,str,str,str,str]:
     sev_c = _canon_sev(parsed.get("Severity of Harm","S3"))
-    severity_num = _SEV_NUM.get(sev_c, 3)
+    s_num = _SEV_NUM.get(sev_c, 3)
     p0 = _canon_p(parsed.get("P0","Medium"))
     p1 = _canon_p(parsed.get("P1","Medium"))
     poh_matrix = {
@@ -289,13 +277,13 @@ def _calculate_risk_fields(parsed: Dict[str, Any]) -> Tuple[int, str, str, str, 
         ("Very High","High"):"Very High", ("Very High","Very High"):"Very High",
     }
     poh = poh_matrix.get((p0,p1), "Medium")
-    if severity_num >= 4 and poh in ("High","Very High"): ri = "Extreme"
-    elif severity_num >= 3 and poh in ("High","Very High"): ri = "High"
+    if s_num >= 4 and poh in ("High","Very High"): ri = "Extreme"
+    elif s_num >= 3 and poh in ("High","Very High"): ri = "High"
     else: ri = "Medium"
-    return severity_num, p0, p1, poh, ri
+    return s_num, p0, p1, poh, ri
 
 # =========================
-# LLM prompting
+# LLM prompting helpers
 # =========================
 _PROMPT = """You are generating ONE Hazard Analysis record as STRICT JSON ONLY.
 Return EXACTLY one JSON object and nothing else.
@@ -323,7 +311,6 @@ Risk to Health: {risk}
 
 def _generate_text(prompt: str) -> str:
     import torch
-    from transformers import AutoTokenizer
     tok = _load_tokenizer()
     _load_model()
     inputs = tok(prompt, return_tensors="pt")
@@ -337,14 +324,14 @@ def _generate_text(prompt: str) -> str:
         gen_kwargs.update(dict(do_sample=False, num_beams=NUM_BEAMS))
     with torch.no_grad():
         out = _model.generate(**inputs, **gen_kwargs)  # type: ignore
-    return _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
+    return tok.decode(out[0], skip_special_tokens=True)
 
 def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     if not USE_HA_ADAPTER:
         return {}
     decoded = _generate_text(_PROMPT.format(risk=risk))
     js = _extract_json(decoded) or {}
-    # simple retry if any of the 4 core fields are blank
+    # retry if any core field blank
     needs = [k for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"] if not str(js.get(k,"")).strip()]
     if needs:
         decoded = _generate_text(_PROMPT.format(risk=risk) + "\nDo not leave any field blank.")
@@ -355,7 +342,49 @@ def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     return js
 
 # =========================
-# RAG + MAUDE enrichment
+# Anti-copy helpers (similarity + paraphrase)
+# =========================
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9
+    return float(a @ b / denom)
+
+def _llm_paraphrase(text: str) -> str:
+    try:
+        prompt = f"""Rephrase the following into one concise medical phrase (<= {PARAPHRASE_MAX_WORDS} words).
+Keep meaning and terminology accurate. Output only the phrase.
+
+Text:
+{text}"""
+        decoded = _generate_text(prompt)
+        line = decoded.strip().splitlines()[-1].strip().strip('"').strip()
+        return line if len(line) >= 3 else text
+    except Exception:
+        return text
+
+def _maybe_paraphrase_if_similar(source: str, candidate: str) -> str:
+    if not PARAPHRASE_FROM_RAG:
+        return candidate
+    s = (source or "").strip()
+    c = (candidate or "").strip()
+    if not s or not c:
+        return c
+    if _HAS_EMB and _emb is not None:
+        try:
+            v1 = _emb.encode([s], convert_to_numpy=True)[0]  # type: ignore
+            v2 = _emb.encode([c], convert_to_numpy=True)[0]  # type: ignore
+            if _cosine_sim(v1, v2) >= SIM_THRESHOLD:
+                return _llm_paraphrase(c)
+            return c
+        except Exception:
+            pass
+    # fallback: token overlap
+    s_tok = set(re.findall(r"[A-Za-z]+", s.lower()))
+    c_tok = set(re.findall(r"[A-Za-z]+", c.lower()))
+    overlap = len(s_tok & c_tok) / (len(c_tok) + 1e-9)
+    return _llm_paraphrase(c) if overlap > 0.85 else c
+
+# =========================
+# RAG + MAUDE enrichment & provenance-aware paraphrase
 # =========================
 def _lookup_exact_rag(risk: str) -> Optional[Dict[str, Any]]:
     if not _RAG_DB:
@@ -363,12 +392,11 @@ def _lookup_exact_rag(risk: str) -> Optional[Dict[str, Any]]:
     for r in _RAG_DB:
         if str(r.get("Risk to Health","")).strip().lower() == risk.strip().lower():
             return r
-    # fallback to embedding similarity if available
-    if _HAS_EMB and _RAG_EMB is not None and _RAG_TEXTS:
+    # simple embedding fallback
+    if _HAS_EMB and _emb is not None and _RAG_TEXTS:
         try:
-            corpus = _RAG_TEXTS
-            emb = _RAG_EMB.encode(corpus, convert_to_numpy=True)  # type: ignore
-            q = _RAG_EMB.encode([risk], convert_to_numpy=True)[0]  # type: ignore
+            emb = _emb.encode(_RAG_TEXTS, convert_to_numpy=True)  # type: ignore
+            q = _emb.encode([risk], convert_to_numpy=True)[0]     # type: ignore
             sims = (emb @ q) / (np.linalg.norm(emb, axis=1) * (np.linalg.norm(q) + 1e-9))
             i = int(sims.argmax())
             if float(sims[i]) >= 0.55:
@@ -431,7 +459,6 @@ def _get_maude_rows(device_brand: str, risk_to_health: str) -> List[Dict[str, An
         rows: List[Dict[str, Any]] = []
         for ev in evs:
             text = ev.get("event_description") or ev.get("description_of_event") or ""
-            # try LLM mapping; if fails, cheap heuristics
             mapping = _maude_llm_extract(text) if USE_HA_ADAPTER else None
             if not mapping:
                 t = text.lower()
@@ -447,23 +474,25 @@ def _get_maude_rows(device_brand: str, risk_to_health: str) -> List[Dict[str, An
                     "Harm": "Potential patient injury",
                     "Sequence of Events": "Setup/use error with inadequate mitigation",
                 }
-            rows.append({
-                "Risk to Health": risk_to_health,
-                **mapping
-            })
+            rows.append({"Risk to Health": risk_to_health, **mapping})
         _save_cached(device_brand, rows)
         return rows
     except Exception:
         return []
 
 def _merge_with_rag_and_maude(parsed: Dict[str, Any], risk: str) -> Dict[str, Any]:
+    rag_filled: Dict[str, str] = {}
+
     # Synthetic RAG first
     rec = _lookup_exact_rag(risk)
     if rec:
-        for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events","Severity of Harm","P0","P1","Risk Control","PoH","Risk Index"]:
+        for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events",
+                  "Severity of Harm","P0","P1","Risk Control","PoH","Risk Index"]:
             if not str(parsed.get(k,"")).strip() and rec.get(k):
                 parsed[k] = rec[k]
-    # MAUDE online enrichment
+                rag_filled[k] = rec[k]
+
+    # MAUDE enrichment second
     if MAUDE_FETCH:
         rows = _get_maude_rows(MAUDE_DEVICE, risk)
         for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]:
@@ -473,6 +502,12 @@ def _merge_with_rag_and_maude(parsed: Dict[str, Any], risk: str) -> Dict[str, An
                     if v:
                         parsed[k] = v
                         break
+
+    # Paraphrase only fields lifted directly from RAG
+    for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events","Risk Control"]:
+        if k in rag_filled:
+            parsed[k] = _maybe_paraphrase_if_similar(rag_filled[k], parsed[k])
+
     return parsed
 
 # =========================
@@ -483,19 +518,14 @@ def _paraphrase_control(text: str) -> str:
         return text
     s = " " + text.strip() + " "
     replacements = [
-        (" shall ", " must "),
-        (" will ", " must "),
-        (" ensure ", " make sure "),
-        (" within ", " kept within "),
-        (" accuracy ", " precision "),
-        (" user ", " operator "),
-        (" device ", " unit "),
+        (" shall ", " must "), (" will ", " must "), (" ensure ", " make sure "),
+        (" within ", " kept within "), (" accuracy ", " precision "),
+        (" user ", " operator "), (" device ", " unit "),
     ]
-    for a,b in replacements:
-        s = s.replace(a, b)
+    for a,b in replacements: s = s.replace(a,b)
     s = s.strip()
     if len(s) < 30:
-        s = "The design shall make sure that " + s[0].lower() + s[1:]
+        s = "The design must " + s[0].lower() + s[1:]
     return s
 
 def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> Tuple[str, str]:
@@ -506,11 +536,11 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> Tuple[st
         return _paraphrase_control(reqs[0].get("Requirements","") or generic), "first"
     try:
         corpus = [str(r.get("Requirements") or "") for r in reqs]
-        ids = [str(r.get("Requirement ID") or "") for r in reqs]
+        ids    = [str(r.get("Requirement ID") or "") for r in reqs]
         vecs = _emb.encode(corpus, convert_to_numpy=True)  # type: ignore
-        q = _emb.encode([hint_text or "risk control"], convert_to_numpy=True)[0]  # type: ignore
+        q    = _emb.encode([hint_text or "risk control"], convert_to_numpy=True)[0]  # type: ignore
         sims = (vecs @ q) / (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(q) + 1e-9))
-        top = int(sims.argmax())
+        top  = int(sims.argmax())
         chosen = f"{corpus[top]} (Ref: {ids[top]})" if 0 <= top < len(corpus) else generic
         return _paraphrase_control(chosen), "nearest"
     except Exception:
@@ -519,9 +549,6 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> Tuple[st
 # =========================
 # Row generation
 # =========================
-def _normalize_req_text(t: str) -> str:
-    return (t or "").replace("±", "+/-")
-
 def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -> Dict[str, Any]:
     parsed: Dict[str, Any] = {}
     if USE_HA_ADAPTER:
@@ -532,7 +559,7 @@ def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -
 
     parsed = _merge_with_rag_and_maude(parsed, risk)
 
-    # Debug marker in Space logs
+    # diagnostics
     try:
         print({
             "ha_row_debug": True,
@@ -551,7 +578,10 @@ def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -
     hint = ((parsed.get("Hazardous Situation","") or "") + " " + (parsed.get("Harm","") or "")).strip()
     control, _ = _nearest_req_control(requirements, hint)
     if rc_from_model and len(rc_from_model) > 6:
-        control = _paraphrase_control(rc_from_model)
+        # If model/RAG provided a control, ensure it isn't a copy of RAG text
+        rec = _lookup_exact_rag(risk) or {}
+        src = rec.get("Risk Control","")
+        control = _maybe_paraphrase_if_similar(src, _paraphrase_control(rc_from_model))
 
     poh = parsed.get("PoH", poh)
     risk_index = parsed.get("Risk Index", risk_index)
@@ -579,12 +609,11 @@ def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Returns HA rows: for each requirement, one row per default risk.
     """
-    # init once
     try:
         _load_tokenizer()
         _load_model()
     except Exception:
-        pass  # if model load fails, we still return fallback rows
+        pass
 
     out: List[Dict[str, Any]] = []
     for r in (requirements or []):
@@ -593,7 +622,6 @@ def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             try:
                 row = _gen_row_for_risk(requirements, risk, rid)
             except Exception:
-                # fallback if anything fails
                 row = {
                     "requirement_id": rid,
                     "risk_id": f"HA-{abs(hash(risk + rid)) % 10_000:04}",
@@ -612,7 +640,7 @@ def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             out.append(row)
     return out
 
-# Load RAG at import so /debug/ha_status can show rows
+# Load RAG at import so /debug endpoints can show rows
 try:
     _load_rag_db()
 except Exception:
