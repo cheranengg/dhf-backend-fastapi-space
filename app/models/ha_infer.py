@@ -49,7 +49,6 @@ CACHE_DIR = (
     or "/tmp/hf"
 )
 
-
 def _token_cache_kwargs() -> Dict[str, Any]:
     kw: Dict[str, Any] = {"cache_dir": CACHE_DIR}
     if HF_TOKEN:
@@ -63,7 +62,6 @@ def _token_cache_kwargs() -> Dict[str, Any]:
 _HAS_EMB = False
 try:
     from sentence_transformers import SentenceTransformer  # type: ignore
-
     _HAS_EMB = True
 except Exception:
     _HAS_EMB = False
@@ -81,9 +79,7 @@ _emb: Optional["SentenceTransformer"] = None  # type: ignore
 _RAG_DB: List[Dict[str, Any]] = []
 _RAG_TEXTS: List[str] = []
 _RAG_EMB = None
-RAG_SYNTHETIC_PATH = os.getenv(
-    "HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl"
-)
+RAG_SYNTHETIC_PATH = os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl")
 
 
 def _load_tokenizer():
@@ -479,7 +475,6 @@ Context:
 Risk to Health: {risk}
 """
 
-
 def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     _load_model()
     if _model is None or _tokenizer is None:
@@ -585,6 +580,24 @@ def _gen_row_for_risk(
     req_text = (requirements[0].get("Requirements", "") if requirements else "")
     parsed = _merge_with_rag_if_needed(parsed, risk, req_text)
 
+    # ---------- DEBUG PRINT (for Space logs) ----------
+    # Shows whether RAG is loaded/used and which model route is active.
+    try:
+        print({
+            "used_rag": bool(parsed) and any(
+                not str(parsed.get(k, "")).strip()
+                for k in ["Hazard", "Hazardous Situation", "Harm", "Sequence of Events"]
+            ) is False,  # if fields are now filled, RAG/model succeeded
+            "rag_rows": len(_RAG_DB),
+            "adapter": USE_HA_ADAPTER,
+            "merged": USE_HA_MODEL,
+            "req_id": rid,
+            "risk": risk
+        })
+    except Exception:
+        pass
+    # --------------------------------------------------
+
     severity_num, p0, p1, poh, risk_index = _calculate_risk_fields(parsed or {})
 
     # Use HS+Harm as hint for nearest requirement mapping
@@ -628,7 +641,6 @@ def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     # If both adapter and merged are disabled, do the quick fallback.
     if not (USE_HA_ADAPTER or USE_HA_MODEL):
-        # still load RAG so risk_control may be less generic if you later enable it
         _load_rag_db()
         return _fallback_ha(requirements)
 
