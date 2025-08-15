@@ -68,11 +68,11 @@ _RAG_DB: List[Dict[str, Any]] = []
 _RAG_TEXTS: List[str] = []
 
 # =========================
-# MAUDE fetch
+# MAUDE fetch (supports multiple devices)
 # =========================
 MAUDE_FETCH     = os.getenv("MAUDE_FETCH", "1") == "1"      # default ON
 MAUDE_DEVICE    = os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM")
-MAUDE_LIMIT     = int(os.getenv("MAUDE_LIMIT", "30"))
+MAUDE_LIMIT     = int(os.getenv("MAUDE_LIMIT", "30"))       # total budget across devices
 MAUDE_TTL       = int(os.getenv("MAUDE_TTL", "86400"))
 MAUDE_CACHE_DIR = os.getenv("MAUDE_CACHE_DIR", "/tmp/maude_cache")
 
@@ -242,7 +242,6 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     js = _balanced_json_block(text)
     obj = _repair_json_str(js) if js else None
     if obj and isinstance(obj, dict):
-        # ensure keys exist
         for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events","Severity of Harm","P0","P1"]:
             obj.setdefault(k, "")
         return obj
@@ -317,6 +316,12 @@ def _generate_text(prompt: str) -> str:
     tok = _load_tokenizer()
     _load_model()
     inputs = tok(prompt, return_tensors="pt")
+    # Move inputs to the same device as the model (fixes warning; speeds up)
+    try:
+        dev = next(_model.parameters()).device  # type: ignore
+        inputs = {k: v.to(dev) for k, v in inputs.items()}
+    except Exception:
+        pass
     gen_kwargs: Dict[str, Any] = dict(
         max_new_tokens=HA_MAX_NEW_TOKENS,
         repetition_penalty=REPETITION_PENALTY,
@@ -379,7 +384,6 @@ def _maybe_paraphrase_if_similar(source: str, candidate: str) -> str:
             return c
         except Exception:
             pass
-    # token overlap fallback
     s_tok = set(re.findall(r"[A-Za-z]+", s.lower()))
     c_tok = set(re.findall(r"[A-Za-z]+", c.lower()))
     overlap = len(s_tok & c_tok) / (len(c_tok) + 1e-9)
@@ -399,6 +403,16 @@ def _lookup_rag_record(risk: str) -> Optional[Dict[str, Any]]:
 # =========================
 # MAUDE fetch + synthesis (preferred for wording)
 # =========================
+def _parse_device_list(device_env: str) -> List[str]:
+    # split on commas, strip, drop empties/dupes
+    items = [s.strip() for s in (device_env or "").split(",")]
+    out, seen = [], set()
+    for it in items:
+        if it and it.lower() not in seen:
+            seen.add(it.lower())
+            out.append(it)
+    return out or ["SIGMA SPECTRUM"]
+
 def _cache_path(device_brand: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", device_brand.strip()) or "device"
     os.makedirs(MAUDE_CACHE_DIR, exist_ok=True)
@@ -437,28 +451,58 @@ def _fetch_maude_events(device_brand: str, limit: int) -> List[Dict[str, Any]]:
 
 def _event_narratives(events: List[Dict[str, Any]]) -> List[str]:
     """
-    Extract narratives from results[].mdr_text[].text where text_type_code == 'D'.
+    Extract narratives from MAUDE events.
+    Priority:
+      1) results[].mdr_text[] where text_type_code == 'D' → text
+      2) Any other mdr_text[].text if 'D' not present
+      3) Construct short narrative from device_problem_text / patient_problem_text / event_type
     """
     out: List[str] = []
+
     for ev in events:
-        for t in (ev.get("mdr_text") or []):
+        used = False
+
+        mdr = ev.get("mdr_text") or []
+        for t in mdr:
             if (t.get("text_type_code") or "").upper() == "D":
                 txt = (t.get("text") or "").strip()
                 if txt:
-                    out.append(txt)
-        # rare fallbacks
-        if not out:
-            for k in ("event_description", "description_of_event"):
-                v = (ev.get(k) or "").strip()
-                if v:
-                    out.append(v)
-    # normalize & dedupe
+                    out.append(txt); used = True
+
+        if (not used) and mdr:
+            for t in mdr:
+                txt = (t.get("text") or "").strip()
+                if txt:
+                    out.append(txt); used = True
+
+        if not used:
+            dev_probs = ev.get("device_problem_text") or ev.get("device_problem_code") or []
+            pat_probs = ev.get("patient_problem_text") or ev.get("patient_problem_code") or []
+            evt_type  = (ev.get("event_type") or "").strip()
+            date_str  = (ev.get("date_of_event") or ev.get("event_date") or "").strip()
+
+            def as_list(val):
+                if val is None: return []
+                if isinstance(val, list): return [str(x).strip() for x in val if str(x).strip()]
+                return [str(val).strip()]
+
+            dev_probs = as_list(dev_probs)
+            pat_probs = as_list(pat_probs)
+
+            if dev_probs or pat_probs or evt_type:
+                parts = []
+                if evt_type: parts.append(evt_type.title())
+                if dev_probs: parts.append("device problems: " + ", ".join(dev_probs[:4]))
+                if pat_probs: parts.append("patient effects: " + ", ".join(pat_probs[:4]))
+                if date_str: parts.append(f"date: {date_str}")
+                sentence = "; ".join(parts)
+                if sentence: out.append(sentence)
+
     norm, seen = [], set()
     for s in out:
-        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
         if s and s not in seen:
-            seen.add(s)
-            norm.append(s)
+            seen.add(s); norm.append(s)
     return norm
 
 def _synthesize_from_maude(events: List[Dict[str, Any]], risk: str) -> Dict[str, Any]:
@@ -502,16 +546,35 @@ Event narratives:
         js[k] = v
     return js
 
-def _get_maude_rows(device_brand: str, risk_to_health: str) -> List[Dict[str, Any]]:
-    cached = _load_cached(device_brand, MAUDE_TTL)
-    if cached is not None:
-        return cached
+def _get_maude_rows_multi(device_env: str) -> List[Dict[str, Any]]:
+    """
+    Aggregate events across multiple devices from MAUDE_DEVICE.
+    Respects total MAUDE_LIMIT as an overall budget.
+    """
+    devices = _parse_device_list(device_env)
+    remaining = max(1, MAUDE_LIMIT)
+    all_rows: List[Dict[str, Any]] = []
+    diag_counts: Dict[str, int] = {}
+
+    for i, dev in enumerate(devices):
+        if remaining <= 0:
+            break
+        # simple even split for first pass
+        budget = max(1, remaining // (len(devices) - i) )
+        cached = _load_cached(dev, MAUDE_TTL)
+        rows = cached if cached is not None else _fetch_maude_events(dev, budget)
+        if cached is None:
+            _save_cached(dev, rows)
+        rows = rows[:budget]
+        all_rows.extend(rows)
+        diag_counts[dev] = len(rows)
+        remaining -= len(rows)
+
     try:
-        evs = _fetch_maude_events(device_brand, MAUDE_LIMIT)
-        _save_cached(device_brand, evs)
-        return evs
+        print({"maude_devices": devices, "maude_counts": diag_counts, "maude_total": len(all_rows)})
     except Exception:
-        return []
+        pass
+    return all_rows
 
 # =========================
 # Risk control (no IDs; no refs)
@@ -560,10 +623,10 @@ def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -
     parsed: Dict[str, Any] = {}
     if MAUDE_FETCH:
         try:
-            maude_evs = _get_maude_rows(MAUDE_DEVICE, risk)
+            maude_evs = _get_maude_rows_multi(MAUDE_DEVICE)
             # quick diag on narratives volume
             try:
-                print({"maude_events": len(maude_evs), "maude_narratives": len(_event_narratives(maude_evs))})
+                print({"maude_events_total": len(maude_evs), "maude_narratives": len(_event_narratives(maude_evs))})
             except Exception:
                 pass
             parsed = _synthesize_from_maude(maude_evs, risk) or {}
@@ -577,7 +640,6 @@ def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -
             for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]:
                 if not str(parsed.get(k,"")).strip() and str(llm_js.get(k,"")).strip():
                     parsed[k] = llm_js[k]
-            # enums from LLM if available
             for k in ["Severity of Harm","P0","P1"]:
                 if str(llm_js.get(k,"")).strip():
                     parsed[k] = llm_js[k]
@@ -672,6 +734,9 @@ def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 }
             out.append(row)
     return out
+
+# Backward-compat: some code calls ha_predict(...)
+ha_predict = infer_ha
 
 # Load RAG for enums once so /debug endpoints can show rows
 try:
