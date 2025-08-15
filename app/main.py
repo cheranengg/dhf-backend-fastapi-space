@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import os
+import json
 from typing import Any, Dict, List
 
-from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 # Optional startup hook (no-op if file not present)
@@ -63,6 +64,27 @@ def _limit_requirements(reqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return reqs
 
 
+def _normalize_ha(ha_in: Any) -> List[Dict[str, Any]]:
+    """
+    Harden incoming 'ha' payload to List[Dict].
+    Accepts dict | list | JSON string | anything else -> [].
+    """
+    ha = ha_in
+    try:
+        if isinstance(ha, str):
+            parsed = json.loads(ha)
+            ha = parsed
+    except Exception:
+        ha = []
+    if isinstance(ha, dict):
+        ha = [ha]
+    elif not isinstance(ha, list):
+        ha = []
+    # keep only dict entries
+    ha = [x for x in ha if isinstance(x, dict)]
+    return ha
+
+
 # -------------------------------------------------------------------
 # Endpoints
 # -------------------------------------------------------------------
@@ -81,6 +103,7 @@ def health():
 def hazard_endpoint(
     payload: Dict[str, Any] = Body(...),
     authorization: str | None = Header(default=None),
+    request: Request = None,
 ):
     """
     Request body:
@@ -90,13 +113,24 @@ def hazard_endpoint(
         ...
       ]
     }
+    Add '?debug=1' to the URL to include a small diagnostics block.
     """
     _auth(authorization)
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
         reqs = _limit_requirements(reqs)
         ha_rows = ha_infer.ha_predict(reqs)
-        return {"ok": True, "ha": ha_rows}
+
+        resp: Dict[str, Any] = {"ok": True, "ha": ha_rows}
+        if request and request.query_params.get("debug") == "1":
+            # minimal signals to see why TBDs might appear
+            resp["diag"] = {
+                "rag_rows": len(ha_infer._RAG_DB),
+                "adapter": ha_infer.USE_HA_ADAPTER,
+                "merged": ha_infer.USE_HA_MODEL,
+                "n_rows": len(ha_rows),
+            }
+        return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"HA failed: {e}")
 
@@ -118,8 +152,12 @@ def dvp_endpoint(
         raise HTTPException(status_code=503, detail="DVP disabled (ENABLE_DVP=0).")
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
-        ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
         reqs = _limit_requirements(reqs)
+
+        # ---- Harden 'ha' so downstream code can safely row.get(...) ----
+        ha_rows_raw = payload.get("ha", [])
+        ha_rows: List[Dict[str, Any]] = _normalize_ha(ha_rows_raw)
+
         dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)
         return {"ok": True, "dvp": dvp_rows}
     except Exception as e:
@@ -145,7 +183,7 @@ def _tm_handler(
         raise HTTPException(status_code=503, detail="TM disabled (ENABLE_TM=0).")
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
-        ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
+        ha_rows: List[Dict[str, Any]] = _normalize_ha(payload.get("ha", []))
         dvp_rows: List[Dict[str, Any]] = payload.get("dvp") or []
         reqs = _limit_requirements(reqs)
 
@@ -256,3 +294,18 @@ def debug_smoke(
         return out
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# New: quick status endpoint so we can see model/RAG state from Colab
+@app.get("/debug/ha_status")
+def debug_ha_status():
+    return {
+        "adapter_enabled": ha_infer.USE_HA_ADAPTER,
+        "adapter_repo": getattr(ha_infer, "HA_ADAPTER_REPO", None),
+        "merged_enabled": ha_infer.USE_HA_MODEL,
+        "merged_dir": getattr(ha_infer, "HA_MODEL_DIR", None),
+        "base_model": getattr(ha_infer, "BASE_MODEL_ID", None),
+        "rag_path": getattr(ha_infer, "RAG_SYNTHETIC_PATH", None),
+        "rag_file_exists": os.path.exists(getattr(ha_infer, "RAG_SYNTHETIC_PATH", "")),
+        "rag_rows_loaded": len(getattr(ha_infer, "_RAG_DB", [])),
+    }
