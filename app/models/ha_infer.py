@@ -7,9 +7,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 # =========================
-# Env & defaults
+# Env & defaults (ADAPTER-ONLY)
 # =========================
-# Adapter-only (no merged model support in this file)
 USE_HA_ADAPTER = os.getenv("USE_HA_ADAPTER", "1") == "1"
 HA_ADAPTER_REPO = os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter")
 BASE_MODEL_ID = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
@@ -24,7 +23,6 @@ REPETITION_PENALTY = float(os.getenv("REPETITION_PENALTY", "1.05"))
 
 # Loading / HF cache
 FORCE_CPU = os.getenv("FORCE_CPU", "0") == "1"
-LOAD_4BIT = os.getenv("LOAD_4BIT", "0") == "1"  # not used with accelerate path here, but kept for compat
 OFFLOAD_DIR = os.getenv("OFFLOAD_DIR", "/tmp/offload")
 
 HF_TOKEN = (
@@ -78,14 +76,6 @@ RAG_SYNTHETIC_PATH = ""
 # RAG path + loader
 # =========================
 def _resolve_rag_path() -> str:
-    """
-    Resolve HA RAG JSONL path robustly.
-    Priority:
-      1) HA_RAG_PATH (abs/rel)
-      2) app/rag_sources/ha_synthetic.jsonl (relative to this file)
-      3) rag_sources/ha_synthetic.jsonl (project root)
-      4) common HF Spaces fallbacks
-    """
     base_dir = os.path.dirname(os.path.abspath(__file__))    # .../app/models
     app_dir  = os.path.normpath(os.path.join(base_dir, ".."))
     root_dir = os.path.normpath(os.path.join(app_dir, ".."))
@@ -113,14 +103,14 @@ def _resolve_rag_path() -> str:
                 return p
         except Exception:
             pass
-    return candidates[0]  # best guess
+    return candidates[0]
 
 
 _CANON_KEYS = {
     "risk id": "Risk ID",
     "risk to health": "Risk to Health",
     "hazard": "Hazard",
-    "hazardous situation": "Hazardous Situation",  # accepts "Hazardous situation"
+    "hazardous situation": "Hazardous Situation",  # also matches "Hazardous situation"
     "harm": "Harm",
     "sequence of events": "Sequence of Events",
     "severity of harm": "Severity of Harm",
@@ -212,11 +202,9 @@ def _load_rag_db(path: Optional[str] = None):
 def _rag_lookup(risk: str, requirement_text: str = "") -> Optional[Dict[str, Any]]:
     if not _RAG_DB:
         return None
-    # exact risk
     exact = [r for r in _RAG_DB if str(r.get("Risk to Health","")).strip().lower() == risk.lower()]
     if exact:
         return exact[0]
-    # semantic
     if not (_HAS_EMB and _RAG_EMB is not None):
         return None
     try:
@@ -240,16 +228,15 @@ def _load_tokenizer():
     from transformers import AutoTokenizer
     if _tokenizer is not None:
         return _tokenizer
-    src = BASE_MODEL_ID
     try:
-        tok = AutoTokenizer.from_pretrained(src, use_fast=False, **_token_cache_kwargs())
+        tok = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=False, **_token_cache_kwargs())
         try:
             tok.legacy = True  # type: ignore[attr-defined]
         except Exception:
             pass
         _tokenizer = tok
     except Exception:
-        _tokenizer = AutoTokenizer.from_pretrained(src, use_fast=True, **_token_cache_kwargs())
+        _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=True, **_token_cache_kwargs())
     if getattr(_tokenizer, "pad_token", None) is None:
         _tokenizer.pad_token = _tokenizer.eos_token  # type: ignore[attr-defined]
     return _tokenizer
@@ -391,7 +378,7 @@ def _generate_text(prompt: str) -> str:
     import torch
     tok = _load_tokenizer()
     _load_model()
-    inputs = tok(prompt, return_tensors="pt")  # leave tensors on CPU; accelerate moves weights
+    inputs = tok(prompt, return_tensors="pt")  # accelerate places tensors; no .to(...)
     gen_kwargs: Dict[str, Any] = dict(
         max_new_tokens=HA_MAX_NEW_TOKENS,
         repetition_penalty=REPETITION_PENALTY,
@@ -400,13 +387,17 @@ def _generate_text(prompt: str) -> str:
         gen_kwargs.update(dict(do_sample=True, temperature=TEMPERATURE, top_p=TOP_P, num_beams=1))
     else:
         gen_kwargs.update(dict(do_sample=False, num_beams=NUM_BEAMS))
-    with torch.no_grad():
-        out = _model.generate(**inputs, **gen_kwargs)  # type: ignore
-    return _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
+    try:
+        with torch.no_grad():
+            out = _model.generate(**inputs, **gen_kwargs)  # type: ignore
+        return _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
+    except Exception as e:
+        print({"ha_generate_error": str(e)})
+        raise
 
 def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
     if not USE_HA_ADAPTER:
-        return {}  # adapter-only build: if disabled, skip model gen
+        return {}
     decoded = _generate_text(_PROMPT.format(risk=risk))
     return _extract_json(decoded) or {}
 
@@ -522,7 +513,7 @@ def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -
     req_text = (requirements[0].get("Requirements", "") if requirements else "")
     parsed = _merge_with_rag_if_needed(parsed, risk, req_text)
 
-    # Debug print
+    # Debug print to Space logs
     try:
         print({
             "ha_row_debug": True,
@@ -566,7 +557,6 @@ def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -
 # Public API
 # =========================
 def _fallback_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Keep a lightweight fallback if adapter disabled
     rows: List[Dict[str, Any]] = []
     for r in requirements:
         rid = str(r.get("Requirement ID") or "")
@@ -598,7 +588,6 @@ def ha_predict(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not USE_HA_ADAPTER:
         return _fallback_ha(requirements)
 
-    # Ensure model/tokenizer/embeddings ready
     try:
         _load_tokenizer()
         _load_model()
