@@ -70,7 +70,7 @@ _RAG_TEXTS: List[str] = []
 # =========================
 # MAUDE fetch
 # =========================
-MAUDE_FETCH     = os.getenv("MAUDE_FETCH", "1") == "1"      # <-- default ON per your request
+MAUDE_FETCH     = os.getenv("MAUDE_FETCH", "1") == "1"      # default ON
 MAUDE_DEVICE    = os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM")
 MAUDE_LIMIT     = int(os.getenv("MAUDE_LIMIT", "30"))
 MAUDE_TTL       = int(os.getenv("MAUDE_TTL", "86400"))
@@ -80,7 +80,7 @@ MAUDE_CACHE_DIR = os.getenv("MAUDE_CACHE_DIR", "/tmp/maude_cache")
 # Anti-copy (from RAG) controls
 # =========================
 PARAPHRASE_FROM_RAG   = os.getenv("PARAPHRASE_FROM_RAG", "1") == "1"
-SIM_THRESHOLD         = float(os.getenv("SIM_THRESHOLD", "0.9"))  # a bit stricter
+SIM_THRESHOLD         = float(os.getenv("SIM_THRESHOLD", "0.9"))  # stricter
 PARAPHRASE_MAX_WORDS  = int(os.getenv("PARAPHRASE_MAX_WORDS", "18"))
 
 # =========================
@@ -240,7 +240,13 @@ def _repair_json_str(js: str) -> Optional[Dict[str, Any]]:
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     js = _balanced_json_block(text)
-    return _repair_json_str(js) if js else None
+    obj = _repair_json_str(js) if js else None
+    if obj and isinstance(obj, dict):
+        # ensure keys exist
+        for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events","Severity of Harm","P0","P1"]:
+            obj.setdefault(k, "")
+        return obj
+    return None
 
 # =========================
 # Enums & scoring
@@ -328,7 +334,6 @@ def _gen_json_for_risk(risk: str) -> Dict[str, Any]:
         return {}
     decoded = _generate_text(_PROMPT.format(risk=risk))
     js = _extract_json(decoded) or {}
-    # retry if blank core fields
     needs = [k for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"] if not str(js.get(k,"")).strip()]
     if needs:
         decoded = _generate_text(_PROMPT.format(risk=risk) + "\nDo not leave any field blank.")
@@ -417,6 +422,9 @@ def _save_cached(device_brand: str, rows: List[Dict[str, Any]]):
         pass
 
 def _fetch_maude_events(device_brand: str, limit: int) -> List[Dict[str, Any]]:
+    """
+    Fetch raw MAUDE events by brand or generic name.
+    """
     url = "https://api.fda.gov/device/event.json"
     params = {
         "search": f'device.brand_name:"{device_brand}" OR device.generic_name:"{device_brand}"',
@@ -424,24 +432,47 @@ def _fetch_maude_events(device_brand: str, limit: int) -> List[Dict[str, Any]]:
     }
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-    return r.json().get("results", [])
+    data = r.json()
+    return data.get("results", []) or []
+
+def _event_narratives(events: List[Dict[str, Any]]) -> List[str]:
+    """
+    Extract narratives from results[].mdr_text[].text where text_type_code == 'D'.
+    """
+    out: List[str] = []
+    for ev in events:
+        for t in (ev.get("mdr_text") or []):
+            if (t.get("text_type_code") or "").upper() == "D":
+                txt = (t.get("text") or "").strip()
+                if txt:
+                    out.append(txt)
+        # rare fallbacks
+        if not out:
+            for k in ("event_description", "description_of_event"):
+                v = (ev.get(k) or "").strip()
+                if v:
+                    out.append(v)
+    # normalize & dedupe
+    norm, seen = [], set()
+    for s in out:
+        s = re.sub(r"\s+", " ", s)
+        if s and s not in seen:
+            seen.add(s)
+            norm.append(s)
+    return norm
 
 def _synthesize_from_maude(events: List[Dict[str, Any]], risk: str) -> Dict[str, Any]:
     """
-    Summarize multiple MAUDE events into 4 fields via the adapter.
-    This produces original wording grounded in MAUDE text.
+    Summarize multiple MAUDE narratives into 4 descriptive fields using the adapter.
     """
-    if not events:
+    notes = _event_narratives(events)
+    if not notes:
         return {}
-    # Build a compact bullet list to keep prompt size reasonable
+
     bullets = []
-    for e in events[:10]:
-        txt = e.get("event_description") or e.get("description_of_event") or ""
-        if not txt: continue
-        txt = re.sub(r"\s+", " ", txt).strip()
-        if len(txt) > 400:  # clip long narratives
-            txt = txt[:400] + "..."
-        bullets.append(f"- {txt}")
+    for txt in notes[:12]:
+        t = txt if len(txt) <= 400 else (txt[:400] + "...")
+        bullets.append(f"- {t}")
     context = "\n".join(bullets)
 
     prompt = f"""Using ONLY the following adverse event narratives, produce STRICT JSON with:
@@ -454,7 +485,7 @@ def _synthesize_from_maude(events: List[Dict[str, Any]], risk: str) -> Dict[str,
 
 Rules:
 - Be specific but <= 18 words per field.
-- Use clinical wording; do not copy sentences from the list.
+- Use clinical wording; do not copy verbatim from the list.
 - Output JSON only.
 
 Risk to Health: {risk}
@@ -464,8 +495,8 @@ Event narratives:
 """
     decoded = _generate_text(prompt)
     js = _extract_json(decoded) or {}
-    # tiny cleanups
-    for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]:
+
+    for k in ["Hazard", "Hazardous Situation", "Harm", "Sequence of Events"]:
         v = (js.get(k) or "").strip()
         v = re.sub(r"\s+", " ", v)
         js[k] = v
@@ -525,43 +556,48 @@ def _nearest_req_control(reqs: List[Dict[str, Any]], hint_text: str) -> str:
 # Row generation
 # =========================
 def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -> Dict[str, Any]:
-    # 1) Start with MAUDE narratives → synthesize 4 fields
+    # 1) MAUDE narratives → synthesize 4 fields
     parsed: Dict[str, Any] = {}
     if MAUDE_FETCH:
         try:
             maude_evs = _get_maude_rows(MAUDE_DEVICE, risk)
+            # quick diag on narratives volume
+            try:
+                print({"maude_events": len(maude_evs), "maude_narratives": len(_event_narratives(maude_evs))})
+            except Exception:
+                pass
             parsed = _synthesize_from_maude(maude_evs, risk) or {}
         except Exception:
             parsed = {}
 
-    # 2) If any descriptive field still blank, use adapter prompt (no RAG)
+    # 2) LLM fallback for any blank core fields
     if not all((parsed.get(k) for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"])):
         try:
             llm_js = _gen_json_for_risk(risk)
             for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]:
                 if not str(parsed.get(k,"")).strip() and str(llm_js.get(k,"")).strip():
                     parsed[k] = llm_js[k]
-            # pull enums from LLM if provided
+            # enums from LLM if available
             for k in ["Severity of Harm","P0","P1"]:
                 if str(llm_js.get(k,"")).strip():
                     parsed[k] = llm_js[k]
         except Exception:
             pass
 
-    # 3) Backfill ONLY enums from RAG (no wording)
+    # 3) Backfill ONLY enums from RAG
     rec = _lookup_rag_record(risk) or {}
     for k in ["Severity of Harm","P0","P1","PoH","Risk Index"]:
         if not str(parsed.get(k,"")).strip() and str(rec.get(k,"")).strip():
             parsed[k] = rec[k]
 
-    # 4) Anti-copy vs RAG (if somehow text matches a RAG sentence)
+    # 4) Anti-copy vs RAG for descriptive fields
     if rec:
         for k in ["Hazard","Hazardous Situation","Harm","Sequence of Events"]:
             src = rec.get(k, "")
             if src and parsed.get(k):
                 parsed[k] = _maybe_paraphrase_if_similar(src, parsed[k])
 
-    # 5) Compute enums and risk index if needed
+    # 5) Compute enums/risk index if still missing
     severity_num, p0, p1, poh, risk_index = _calculate_risk_fields(parsed or {})
     poh = parsed.get("PoH", poh)
     risk_index = parsed.get("Risk Index", risk_index)
@@ -603,6 +639,9 @@ def _gen_row_for_risk(requirements: List[Dict[str, Any]], risk: str, rid: str) -
 # Public API
 # =========================
 def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Returns n_requirements * len(_DEFAULT_RISKS) rows.
+    """
     try:
         _load_tokenizer()
         _load_model()
