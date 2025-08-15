@@ -7,27 +7,31 @@ from typing import Any, Dict, List
 from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# Optional startup hook (cache clean)
+# Optional startup hook (no-op if file not present)
 try:
     import startup_cleanup  # noqa: F401
 except Exception:
     pass
 
-# Models
-from app.models import ha_infer
+# Feature flags (so you can turn pieces on/off from Space settings)
+ENABLE_DVP = os.getenv("ENABLE_DVP", "1") == "1"
+ENABLE_TM  = os.getenv("ENABLE_TM",  "0") == "1"  # start disabled until ready
+MAX_REQS   = int(os.getenv("MAX_REQS", "10"))
 
-# DVP is optional; import guarded
-_HAS_DVP = False
+# Import model modules
+from app.models import ha_infer, dvp_infer  # type: ignore
+
+# TM is optional: import if present, otherwise we’ll provide a fallback
+_tm_available = False
 try:
-    from app.models import dvp_infer  # type: ignore
-    _HAS_DVP = True
+    from app.models import tm_infer  # type: ignore
+    _tm_available = True
 except Exception:
-    _HAS_DVP = False
+    _tm_available = False
 
-# Flags
-ENABLE_DVP = os.getenv("ENABLE_DVP", "0") == "1"
-
+# -------------------------------------------------------------------
 # Auth / App setup
+# -------------------------------------------------------------------
 BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "devtoken")
 
 app = FastAPI(title="DHF Backend")
@@ -40,80 +44,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 def _auth(authorization: str | None):
+    """Simple bearer-token auth shared by all endpoints."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing token")
     token = authorization.split(" ", 1)[1].strip()
     if token != BACKEND_TOKEN:
         raise HTTPException(status_code=403, detail="Bad token")
 
+
+def _limit_requirements(reqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Cap volume to keep inference stable/responsive."""
+    if not isinstance(reqs, list):
+        return []
+    if MAX_REQS and len(reqs) > MAX_REQS:
+        return reqs[:MAX_REQS]
+    return reqs
+
+
+# -------------------------------------------------------------------
+# Endpoints
+# -------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        # HA
-        "USE_HA_MODEL": os.getenv("USE_HA_MODEL"),
-        "BASE_MODEL_ID": os.getenv("BASE_MODEL_ID"),
-        "HA_ADAPTER_REPO": os.getenv("HA_ADAPTER_REPO"),
-        # DVP
-        "ENABLE_DVP": ENABLE_DVP,
-        "HAS_DVP_MODULE": _HAS_DVP,
+        "enable_dvp": ENABLE_DVP,
+        "enable_tm": ENABLE_TM,
+        "tm_available": _tm_available,
+        "max_reqs": MAX_REQS,
     }
 
-# -------------------- HA --------------------
+
 @app.post("/hazard-analysis")
 def hazard_endpoint(
     payload: Dict[str, Any] = Body(...),
     authorization: str | None = Header(default=None),
 ):
     """
-    Body: {"requirements":[{"Requirement ID":"...","Requirements":"..."}, ...]}
+    Request body:
+    {
+      "requirements": [
+        {"Requirement ID": "...", "Requirements": "..."},
+        ...
+      ]
+    }
     """
     _auth(authorization)
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
-        max_req = int(os.getenv("MAX_REQS", "10"))
-        reqs = reqs[:max_req]
+        reqs = _limit_requirements(reqs)
         ha_rows = ha_infer.ha_predict(reqs)
         return {"ok": True, "ha": ha_rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"HA failed: {e}")
 
-# -------------------- DVP --------------------
-def _dvp_stub(requirements: List[Dict[str, Any]], ha: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Safe fallback so the UI doesn't 404 while DVP model is off."""
-    TECH = ["electrical","mechanical","flow","pressure","occlusion","accuracy","alarm"]
-    VIS  = ["label","marking","display","visual","color","contrast","font"]
-    out: List[Dict[str, Any]] = []
-    for r in requirements or []:
-        rid = str(r.get("Requirement ID") or r.get("requirement_id") or "")
-        vid = str(r.get("Verification ID") or r.get("verification_id") or "")
-        txt = str(r.get("Requirements") or r.get("requirements") or "")
-        low = txt.lower()
-        if not txt or txt.lower().endswith("requirements"):
-            out.append({
-                "verification_id": vid, "requirement_id": rid, "requirements": txt,
-                "verification_method": "NA", "sample_size": "NA",
-                "test_procedure": "NA", "acceptance_criteria": "NA",
-            })
-            continue
-        method = "Physical Testing" if any(k in low for k in TECH) else ("Visual Inspection" if any(k in low for k in VIS) else "Physical Inspection")
-        sample = "30"
-        ac = "TBD"
-        if "flow" in low: ac = "±5% from set value (IEC 60601-2-24)"
-        elif "occlusion" in low: ac = "Alarm ≤ 30 s at 100 kPa back pressure (IEC 60601-2-24)"
-        bullets = (
-            "- Verify at three setpoints; record measured vs setpoint (n=3).\n"
-            "- Repeatability across 5 cycles; compute deviation and std dev.\n"
-            "- Boundary test at min/max; record alarms and pass/fail.\n"
-            "- Capture equipment IDs and calibration; attach raw data."
-        )
-        out.append({
-            "verification_id": vid, "requirement_id": rid, "requirements": txt,
-            "verification_method": method, "sample_size": sample,
-            "test_procedure": bullets, "acceptance_criteria": ac,
-        })
-    return out
 
 @app.post("/dvp")
 def dvp_endpoint(
@@ -121,42 +107,152 @@ def dvp_endpoint(
     authorization: str | None = Header(default=None),
 ):
     """
-    Body:
+    Request body:
     {
-      "requirements": [...],   # same shape as HA input
-      "ha": [...]              # optional HA rows
+      "requirements": [...],   # same shape as hazard-analysis
+      "ha": [...]              # output from hazard-analysis (optional but helpful)
     }
     """
     _auth(authorization)
+    if not ENABLE_DVP:
+        raise HTTPException(status_code=503, detail="DVP disabled (ENABLE_DVP=0).")
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
         ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
-        max_req = int(os.getenv("MAX_REQS", "10"))
-        reqs = reqs[:max_req]
-
-        # If model is enabled and module exists, use it; else stub.
-        if ENABLE_DVP and _HAS_DVP:
-            rows = dvp_infer.dvp_predict(reqs, ha_rows)  # type: ignore
-        else:
-            rows = _dvp_stub(reqs, ha_rows)
-        return {"ok": True, "dvp": rows}
+        reqs = _limit_requirements(reqs)
+        dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)
+        return {"ok": True, "dvp": dvp_rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DVP failed: {e}")
 
-# -------------------- Smoke --------------------
+
+# ---------------- TM handlers (two routes mapping to same function) -------------
+def _tm_handler(
+    payload: Dict[str, Any],
+    authorization: str | None,
+) -> Dict[str, Any]:
+    """
+    Accepts:
+    {
+      "requirements": [...],
+      "ha": [...],
+      "dvp": [...]
+    }
+    Returns: {"ok": true, "tm": [...]}
+    """
+    _auth(authorization)
+    if not ENABLE_TM:
+        raise HTTPException(status_code=503, detail="TM disabled (ENABLE_TM=0).")
+    try:
+        reqs: List[Dict[str, Any]] = payload.get("requirements") or []
+        ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
+        dvp_rows: List[Dict[str, Any]] = payload.get("dvp") or []
+        reqs = _limit_requirements(reqs)
+
+        # If tm_infer is present, use it; otherwise compose a minimal fallback row.
+        if _tm_available and hasattr(tm_infer, "tm_predict"):
+            tm_rows = tm_infer.tm_predict(reqs, ha_rows, dvp_rows)  # type: ignore
+        else:
+            # very light fallback (no model): join key fields so UI doesn’t 404
+            from collections import defaultdict
+
+            # index HA rows by requirement
+            ha_by_req = defaultdict(list)
+            for h in ha_rows:
+                rid = str(h.get("requirement_id") or h.get("Requirement ID") or "")
+                if rid:
+                    ha_by_req[rid].append(h)
+
+            # index DVP rows by verification_id
+            dvp_by_vid = {}
+            for d in dvp_rows:
+                vid = str(d.get("verification_id") or d.get("Verification ID") or "")
+                if vid and vid not in dvp_by_vid:
+                    dvp_by_vid[vid] = d
+
+            def j(values):
+                # join unique, skip blanks / NA
+                vals = [str(v).strip() for v in values if str(v).strip() and str(v).strip().upper() != "NA"]
+                seen = []
+                for v in vals:
+                    if v not in seen:
+                        seen.append(v)
+                return ", ".join(seen) if seen else "TBD - Human / SME input"
+
+            tm_rows: List[Dict[str, Any]] = []
+            for r in reqs:
+                rid = str(r.get("Requirement ID") or "")
+                vid = str(r.get("Verification ID") or "")
+                rtxt = str(r.get("Requirements") or "")
+
+                ha_slice = ha_by_req.get(rid, [])
+                drow = dvp_by_vid.get(vid, {})
+
+                risk_ids = j([h.get("risk_id") or h.get("Risk ID") or "" for h in ha_slice])
+                risks    = j([h.get("risk_to_health") or h.get("Risk to Health") or "" for h in ha_slice])
+                controls = j([h.get("risk_control") or h.get("HA Risk Control") or "" for h in ha_slice])
+
+                method = drow.get("verification_method") or drow.get("Verification Method") or "TBD - Human / SME input"
+                crit   = drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "TBD - Human / SME input"
+
+                tm_rows.append({
+                    "verification_id": vid or "NA",
+                    "requirement_id": rid,
+                    "requirements": rtxt,
+                    "risk_ids": risk_ids,
+                    "risks_to_health": risks,
+                    "ha_risk_controls": controls,
+                    "verification_method": method,
+                    "acceptance_criteria": crit,
+                })
+
+        return {"ok": True, "tm": tm_rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TM failed: {e}")
+
+
+@app.post("/tm")
+def tm_endpoint(
+    payload: Dict[str, Any] = Body(...),
+    authorization: str | None = Header(default=None),
+):
+    return _tm_handler(payload, authorization)
+
+
+@app.post("/trace-matrix")
+def trace_matrix_endpoint(
+    payload: Dict[str, Any] = Body(...),
+    authorization: str | None = Header(default=None),
+):
+    return _tm_handler(payload, authorization)
+
+
+# ------------------------- Debug -----------------------------------
 @app.post("/debug/smoke")
-def debug_smoke(authorization: str | None = Header(default=None)):
+def debug_smoke(
+    authorization: str | None = Header(default=None),
+):
+    """
+    Quick smoke test that runs HA (always) and DVP/TM if enabled.
+    """
     _auth(authorization)
     reqs = [
-        {"Requirement ID": "REQ-001", "Requirements": "Pump shall maintain flow accuracy within ±5%."},
-        {"Requirement ID": "REQ-002", "Requirements": "Device labeling shall be legible at 30 cm and use ISO 15223-1 symbols."},
+        {"Requirement ID": "REQ-001", "Verification ID": "VER-001",
+         "Requirements": "The pump shall maintain flow accuracy within ±5% from set value."},
+        {"Requirement ID": "REQ-002", "Verification ID": "VER-002",
+         "Requirements": "Labeling shall be legible at 30 cm and use ISO 15223-1 symbols."},
     ]
     try:
-        ha_rows = ha_infer.ha_predict(reqs)
-        if ENABLE_DVP and _HAS_DVP:
-            dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)  # type: ignore
-        else:
-            dvp_rows = _dvp_stub(reqs, ha_rows)
-        return {"ok": True, "ha": ha_rows, "dvp": dvp_rows}
+        ha_rows = ha_infer.ha_predict(_limit_requirements(reqs))
+        out: Dict[str, Any] = {"ok": True, "ha": ha_rows}
+
+        if ENABLE_DVP:
+            dvp_rows = dvp_infer.dvp_predict(_limit_requirements(reqs), ha_rows)
+            out["dvp"] = dvp_rows
+
+        if ENABLE_TM:
+            out["tm"] = _tm_handler({"requirements": reqs, "ha": ha_rows, "dvp": out.get("dvp", [])}, authorization)["tm"]  # type: ignore
+
+        return out
     except Exception as e:
         return {"ok": False, "error": str(e)}
