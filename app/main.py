@@ -300,12 +300,12 @@ def debug_smoke(
 @app.get("/debug/ha_status")
 def debug_ha_status():
     return {
-        "adapter_enabled": ha_infer.USE_HA_ADAPTER,
+        "adapter_enabled": getattr(ha_infer, "USE_HA_ADAPTER", False),
         "adapter_repo": getattr(ha_infer, "HA_ADAPTER_REPO", None),
-        "merged_enabled": ha_infer.USE_HA_MODEL,
-        "merged_dir": getattr(ha_infer, "HA_MODEL_DIR", None),
         "base_model": getattr(ha_infer, "BASE_MODEL_ID", None),
+        # RAG
         "rag_path": getattr(ha_infer, "RAG_SYNTHETIC_PATH", None),
         "rag_file_exists": os.path.exists(getattr(ha_infer, "RAG_SYNTHETIC_PATH", "")),
         "rag_rows_loaded": len(getattr(ha_infer, "_RAG_DB", [])),
     }
+
