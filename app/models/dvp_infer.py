@@ -342,12 +342,12 @@ Context (standards/snippets):
 {ctx}
 
 Return EXACTLY this JSON object and nothing else:
-{
+{{
   "Verification Method": "Inspection|Visual Inspection|Physical Testing|Software Test|Usability Validation|Analysis",
   "Sample Size": "<integer>",
   "Test Procedure": "2-4 bullet points, each with measurable values (units/thresholds/cycles)",
   "Acceptance Criteria": "Short line restating the requirement as a measurable compliance statement"
-}
+}}
 """
 
 def _clean_bullets(s: str) -> str:
