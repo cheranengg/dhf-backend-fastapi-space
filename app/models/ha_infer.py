@@ -246,7 +246,6 @@ def _pick_rag_seed() -> Optional[str]:
     """Pull a short seed text from the RAG DB using tolerant fields."""
     if not _RAG_DB:
         return None
-    # Try several common keys that could exist in synthetic HA or MAUDE-like entries
     candidate_fields = [
         "Hazard", "hazard",
         "risk_to_health", "Risk to Health",
@@ -336,28 +335,35 @@ Now output ONLY the JSON:"""
     return prompt
 
 
+# --- robust JSON extraction (prefer LAST balanced block) ---
+def _balanced_json_last(text: str) -> Optional[str]:
+    """
+    Return the last balanced {...} block from the text.
+    Avoids accidentally selecting JSON-like braces from the prompt/schema.
+    """
+    depth, start = 0, -1
+    last = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    last = text[start:i + 1]
+    return last
+
+
 def _decode_json_from_text(txt: str) -> Dict[str, Any]:
-    """More robust JSON extraction with multiple fallbacks."""
-    # 1) Strict: first {...} block
-    m = re.search(r"\{.*\}", txt, re.DOTALL)
-    blob = None
-    if m:
-        blob = m.group(0)
-
-    # 2) If none, try to find the last '{' and slice till end
-    if not blob:
-        brace = txt.rfind("{")
-        if brace >= 0:
-            blob = txt[brace:]
-
-    # 3) Last fallback: try to collect key:value lines inside braces
+    """Robust JSON extraction picking the *last* balanced object."""
+    blob = _balanced_json_last(txt)
     if not blob:
         return {}
-
-    # Fix a few common tailing commas
+    # Fix a few common trailing commas
     blob = re.sub(r",\s*}", "}", blob)
     blob = re.sub(r",\s*\]", "]", blob)
-
     try:
         data = json.loads(blob)
         return data if isinstance(data, dict) else {}
