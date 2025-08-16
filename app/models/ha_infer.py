@@ -46,7 +46,7 @@ PARAPHRASE_FROM_RAG: bool = os.getenv("PARAPHRASE_FROM_RAG", "1") == "1"
 PARAPHRASE_MAX_WORDS: int = int(os.getenv("PARAPHRASE_MAX_WORDS", "22"))
 
 # Cap rows defensively (backend already caps)
-ROW_LIMIT: int = int(os.getenv("HA_ROW_LIMIT", "5"))
+ROW_LIMIT: int = int(os.getenv("HA_ROW_LIMIT", "50"))
 
 # Debug logging controls
 DEBUG_HA: bool = os.getenv("DEBUG_HA", "1") == "1"  # prints device/quant + short output peek
