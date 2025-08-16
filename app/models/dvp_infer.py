@@ -16,14 +16,18 @@ HF_TOKEN = (
     or os.getenv("HUGGINGFACE_HUB_TOKEN")
     or None
 )
-CACHE_DIR   = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/hf"
+CACHE_DIR = (
+    os.getenv("HF_HOME")
+    or os.getenv("TRANSFORMERS_CACHE")
+    or "/tmp/hf"
+)
 OFFLOAD_DIR = os.getenv("OFFLOAD_DIR", "/tmp/offload")
 FORCE_CPU   = os.getenv("FORCE_CPU", "0") == "1"
 
 MAX_NEW     = int(os.getenv("DVP_MAX_NEW_TOKENS", "160"))
 INPUT_MAX   = int(os.getenv("DVP_INPUT_MAX_TOKENS", "512"))
-TEMPERATURE = float(os.getenv("DVP_TEMPERATURE", "0.3"))
-TOP_P       = float(os.getenv("DVP_TOP_P", "0.9"))
+TEMPERATURE = float(os.getenv("DVP_TEMPERATURE", "0.30"))
+TOP_P       = float(os.getenv("DVP_TOP_P", "0.90"))
 DO_SAMPLE   = os.getenv("DVP_DO_SAMPLE", "1") == "1"
 NUM_BEAMS   = int(os.getenv("DVP_NUM_BEAMS", "1"))
 REPETITION_PENALTY = float(os.getenv("DVP_REPETITION_PENALTY", "1.05"))
@@ -32,18 +36,19 @@ REPETITION_PENALTY = float(os.getenv("DVP_REPETITION_PENALTY", "1.05"))
 DVP_RAG_PATH      = os.getenv("DVP_RAG_PATH", "app/rag_sources/standards_kb.jsonl")
 DVP_TOP_K         = int(os.getenv("DVP_TOP_K", "4"))
 
-DEBUG_DVP = os.getenv("DEBUG_DVP", "0") == "1"
+DEBUG_DVP = os.getenv("DEBUG_DVP", "1") == "1"
+
 
 def _token_cache_kwargs() -> Dict[str, Any]:
     kw: Dict[str, Any] = {"cache_dir": CACHE_DIR}
-    if HF_TOKEN: kw["token"] = HF_TOKEN
+    if HF_TOKEN:
+        kw["token"] = HF_TOKEN
     return kw
+
 
 # ================================
 # Validation / guardrails-lite
 # ================================
-UNIT_RE = r"(mA|µA|uA|A|V|kV|ms|s|sec|second|seconds|min|h|mL/h|L/h|mL|µL|uL|kPa|Pa|bar|%|dB|Ω|Ohm|°C|g|kg|cycles|N|mm|cm)"
-
 _HAS_GUARDRAILS = False
 try:
     from guardrails import Guard  # type: ignore
@@ -51,26 +56,31 @@ try:
 except Exception:
     _HAS_GUARDRAILS = False
 
+
 def _guard_validate(obj: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     errs: List[str] = []
     out = {
-        "Verification Method": str(obj.get("Verification Method","")).strip() or "NA",
-        "Sample Size": str(obj.get("Sample Size","")).strip() or "NA",
-        "Test Procedure": str(obj.get("Test Procedure","")).strip() or "TBD",
-        "Acceptance Criteria": str(obj.get("Acceptance Criteria","")).strip() or "TBD",
+        "Verification Method": str(obj.get("Verification Method", "")).strip() or "NA",
+        "Sample Size": str(obj.get("Sample Size", "")).strip() or "NA",
+        "Test Procedure": str(obj.get("Test Procedure", "")).strip() or "TBD",
+        "Acceptance Criteria": str(obj.get("Acceptance Criteria", "")).strip() or "TBD",
     }
     if not re.match(r"^[A-Za-z][A-Za-z \-/()]+$", out["Verification Method"]):
         errs.append("Verification Method format invalid")
     if not out["Sample Size"].isdigit():
         errs.append("Sample Size must be a number")
+
+    # 2–4 bullets; at least one line should contain a measurable figure
     bullets = [b.strip() for b in out["Test Procedure"].splitlines() if b.strip().startswith("- ")]
     if not (2 <= len(bullets) <= 4):
         errs.append("Test Procedure should be 2–4 bullets")
-    if not any(re.search(rf"\b\d+(?:\.\d+)?\s?{UNIT_RE}\b", b) for b in bullets):
+    unit_pat = r"(mA|µA|A|V|kV|ms|s|min|h|mL/h|mL|L|kPa|Pa|%|dB|Ω|°C|g|kg|N|cycles|cm|mm|µL|m)"
+    if not any(re.search(rf"[±]?\d+(?:\.\d+)?\s?(?:{unit_pat})", b, flags=re.IGNORECASE) for b in bullets):
         errs.append("At least one bullet must include measurable values")
     if out["Acceptance Criteria"] in ("", "TBD", "NA"):
         errs.append("Acceptance Criteria missing")
     return out, errs
+
 
 # ================================
 # Simple standards heuristics (fallback)
@@ -98,14 +108,6 @@ _TEST_SPEC_MAP = {
     "interop": "HL7 FHIR / IEEE 11073 PHD conformance",
 }
 
-# Domain-specific fallbacks
-AIR_IN_LINE_KEYS = ("air-in-line", "air in line", "air bubble", "air detection", "air-infusion", "air alarm")
-AIR_IN_LINE_BULLETS = [
-    "- Inject an air slug into the line using a calibrated micro-syringe (e.g., 50–200 µL), at 23±2 °C.",
-    "- Verify the device detects the air-in-line event and annunciates an alarm.",
-    "- Measure detection-to-alarm time with a timer/data capture; repeat at 3 flow rates (e.g., 5, 100, 500 mL/h).",
-    "- Record worst-case detection time across 5 repetitions per flow; confirm alarm latching/clearing behavior."
-]
 
 # ================================
 # Optional local FAISS retriever
@@ -124,6 +126,7 @@ _index = None
 _kb_rows: List[Dict[str, Any]] = []
 _kb_texts: List[str] = []
 
+
 def _jsonl_load(path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
@@ -141,16 +144,18 @@ def _jsonl_load(path: str) -> List[Dict[str, Any]]:
             print(f"[dvp] KB load failed for {path}: {e}")
     return rows
 
+
 def _init_retriever():
     """Load KB and build FAISS once (CPU is fine)."""
     global _emb, _index, _kb_rows, _kb_texts
-    if _index is not None:
+    if _index is not None or _kb_rows:
         return
+
     _kb_rows = _jsonl_load(DVP_RAG_PATH)
     _kb_texts = []
     for r in _kb_rows:
         bits = []
-        for k in ("standard","clause","topic","test_name"):
+        for k in ("standard", "clause", "topic", "test_name"):
             v = r.get(k)
             if isinstance(v, str) and v.strip():
                 bits.append(v.strip())
@@ -159,7 +164,9 @@ def _init_retriever():
                 bits.append(b.strip())
         if bits:
             _kb_texts.append(" | ".join(bits))
+
     if _kb_texts and _HAS_RETRIEVAL:
+        # build FAISS
         _emb = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", cache_folder=CACHE_DIR)
         vecs = _emb.encode(_kb_texts, convert_to_numpy=True)
         _index = faiss.IndexFlatL2(vecs.shape[1])
@@ -170,44 +177,33 @@ def _init_retriever():
         if DEBUG_DVP:
             print(f"[dvp] KB loaded: {len(_kb_rows)} rows (FAISS off or empty)")
 
-def _kb_retrieve(req_text: str, k: int = DVP_TOP_K) -> List[Dict[str, Any]]:
-    """Return top-k KB entries relevant to the requirement or heuristic fallbacks."""
-    _init_retriever()
-    # Domain short-circuit: air-in-line
-    t = (req_text or "").lower()
-    if any(k2 in t for k2 in AIR_IN_LINE_KEYS):
-        return [{
-            "standard": "IEC 60601-2-24",
-            "topic": "air-in-line",
-            "test_name": "Air-in-line Detection",
-            "bullets": AIR_IN_LINE_BULLETS,
-            "acceptance_template": "System shall detect an air-in-line event and alarm within the specified time limit under the defined conditions."
-        }]
 
-    if _index is None or _emb is None or not _kb_rows:
-        # heuristic pseudo-hits
-        hits: List[Dict[str, Any]] = []
+def _kb_retrieve(req_text: str, k: int = DVP_TOP_K) -> List[Dict[str, Any]]:
+    """Return top-k KB entries relevant to the requirement."""
+    _init_retriever()
+    if not _kb_rows or _index is None or _emb is None:
+        # heuristic fallback when KB/FAISS is not available
+        t = req_text.lower()
+        hits = []
         for kw, spec in _TEST_SPEC_MAP.items():
             if kw in t:
-                hits.append({"standard":"heuristic","topic":kw,"test_name":kw,
-                             "bullets":[spec],"acceptance_template":spec})
-        if hits:
-            return hits[:k]
-        # generic fallback: take first k specs
-        generic = []
-        for spec in list(_TEST_SPEC_MAP.values())[:k]:
-            generic.append({"standard":"heuristic","topic":"generic","test_name":"Generic Test",
-                            "bullets":[spec],"acceptance_template":spec})
-        return generic
-
+                hits.append({"standard": "heuristic", "topic": kw, "test_name": kw,
+                             "bullets": [spec], "acceptance_template": spec})
+        return hits[:k] if hits else [{"standard": "heuristic", "topic": "generic",
+                                       "test_name": "Generic Test",
+                                       "bullets": list(_TEST_SPEC_MAP.values())[:k],
+                                       "acceptance_template": ""}]
+    # FAISS search
     qv = _emb.encode([req_text], convert_to_numpy=True)
-    n = min(max(1, k), len(_kb_texts))
+    import numpy as np  # local import to be safe if tool not present during import time
+    n = min(k, len(_kb_texts))
     D, I = _index.search(qv, n)
     hits: List[Dict[str, Any]] = []
     for idx in I[0]:
         if 0 <= idx < len(_kb_rows):
             hits.append(_kb_rows[idx])
     return hits
+
 
 # ================================
 # Verification method / sample size
@@ -216,7 +212,8 @@ USABILITY = ["usability", "human factors", "user", "ui", "use error"]
 VISUAL    = ["label", "marking", "display", "color", "symbol"]
 TECH      = ["electrical", "mechanical", "flow", "pressure", "occlusion",
              "accuracy", "alarm", "battery", "software", "leakage", "current",
-             "voltage", "connector", "luer", "emc", "esd", "vibration", "air", "bubble"]
+             "voltage", "connector", "luer", "emc", "esd", "vibration"]
+
 
 def _ssize_by_sev_map() -> Dict[int, int]:
     raw = os.getenv("DVP_SSIZE_BY_SEV")
@@ -224,10 +221,11 @@ def _ssize_by_sev_map() -> Dict[int, int]:
         try:
             nums = [int(x) for x in raw.split(",")]
             if len(nums) >= 5:
-                return {1:nums[0],2:nums[1],3:nums[2],4:nums[3],5:nums[4]}
+                return {1: nums[0], 2: nums[1], 3: nums[2], 4: nums[3], 5: nums[4]}
         except Exception:
             pass
-    return {1:10,2:20,3:30,4:40,5:50}
+    return {1: 10, 2: 20, 3: 30, 4: 40, 5: 50}
+
 
 def _verification_method(text: str) -> str:
     t = (text or "").lower()
@@ -235,6 +233,7 @@ def _verification_method(text: str) -> str:
     if any(w in t for w in VISUAL):    return "Visual Inspection"
     if any(w in t for w in TECH):      return "Physical Testing"
     return "Inspection"
+
 
 def _sample_size(requirement_id: str, ha: List[Dict[str, Any]]) -> str:
     sev_map = _ssize_by_sev_map()
@@ -253,9 +252,10 @@ def _sample_size(requirement_id: str, ha: List[Dict[str, Any]]) -> str:
     # deterministic fallback
     try:
         digit = int(re.sub(r"\D", "", requirement_id)) % 5
-        return str([10,20,30,40,50][digit])
+        return str([10, 20, 30, 40, 50][digit])
     except Exception:
         return "30"
+
 
 # ================================
 # Model loader (prefers _peft_loader)
@@ -264,10 +264,11 @@ _tokenizer = None
 _model     = None
 _logged    = False
 
+
 def _try_peft_loader():
     """Use project-specific PEFT loader if available; return (tok, model) or (None, None)."""
     try:
-        from app.models._peft_loader import load_base_plus_adapter  # project loader
+        from app.models._peft_loader import load_base_plus_adapter
         tok, mdl, device = load_base_plus_adapter(
             base_repo=BASE_MODEL_ID,
             adapter_repo=DVP_ADAPTER_REPO,
@@ -279,8 +280,9 @@ def _try_peft_loader():
         return tok, mdl
     except Exception as e:
         if DEBUG_DVP:
-            print(f"[dvp] _peft_loader failed: {e}")
+            print(f"[dvp] _peft_loader load failed: {e}")
         return None, None
+
 
 def _load_model():
     global _tokenizer, _model, _logged
@@ -294,20 +296,22 @@ def _load_model():
         _init_retriever()
         if DEBUG_DVP and not _logged:
             dev = getattr(_model, "device", "cpu")
-            print(f"[dvp] model ready on {dev}; cache={CACHE_DIR} offload={OFFLOAD_DIR}")
+            print(f"[dvp] model via _peft_loader on {dev}; cache={CACHE_DIR} offload={OFFLOAD_DIR}")
             _logged = True
         return
 
-    # Fallback: direct PEFT load with 4-bit if available
+    # Fallback: local 4-bit PEFT load
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
     try:
         from transformers import BitsAndBytesConfig  # type: ignore
+        dtype = torch.bfloat16 if (torch.cuda.is_available() and not FORCE_CPU and hasattr(torch, "bfloat16")) else (
+                torch.float16 if (torch.cuda.is_available() and not FORCE_CPU) else torch.float32)
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16,
+            bnb_4bit_compute_dtype=dtype,
         )
     except Exception:
         bnb_cfg = None
@@ -317,10 +321,12 @@ def _load_model():
         tok.pad_token = tok.eos_token
 
     load_kwargs = dict(cache_dir=CACHE_DIR, low_cpu_mem_usage=True)
-    if (not FORCE_CPU):
-        load_kwargs.update(dict(device_map="auto", offload_folder=OFFLOAD_DIR))
-        if bnb_cfg is not None:
-            load_kwargs.update(dict(quantization_config=bnb_cfg))
+    import torch
+    if torch.cuda.is_available() and not FORCE_CPU:
+        load_kwargs.update(dict(device_map="auto", torch_dtype=torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16,
+                                offload_folder=OFFLOAD_DIR))
+    if bnb_cfg and not FORCE_CPU:
+        load_kwargs.update(dict(quantization_config=bnb_cfg))
 
     base = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, **load_kwargs)
 
@@ -337,6 +343,7 @@ def _load_model():
         dev = getattr(_model, "device", "cpu")
         print(f"[dvp] model loaded (fallback) on {dev}; cache={CACHE_DIR} offload={OFFLOAD_DIR}")
         _logged = True
+
 
 # ================================
 # Prompt and generation
@@ -359,75 +366,60 @@ Return EXACTLY this JSON object and nothing else:
 }}
 """
 
+
 def _clean_bullets(s: str) -> str:
-    lines = []
+    """Keep 2–4 concise bullet lines. If fewer than 2, return 'TBD'."""
+    lines: List[str] = []
     for line in (s or "").splitlines():
         ln = line.strip().lstrip("-• ").strip()
-        if len(ln.split()) >= 4:
+        # allow slightly shorter lines; still avoid junk
+        if len(ln.split()) >= 3:
             lines.append(f"- {ln}")
         if len(lines) == 4:
             break
-    return "\n".join(lines[:4]) if len(lines) >= 2 else "TBD"
+    return "\n".join(lines) if len(lines) >= 2 else "TBD"
+
 
 def _numbers_from_req(req: str) -> List[str]:
-    return re.findall(rf"\b\d+(?:\.\d+)?\s?{UNIT_RE}\b", req or "")
+    # capture "1 second", "30 s", "±5%", "100 µA", "1.2 m", etc.
+    unit_pat = r"(mA|µA|A|V|kV|ms|s|min|h|mL/h|mL|L|kPa|Pa|%|dB|Ω|ohm|°C|g|kg|N|cycles|cm|mm|µL|m)"
+    hits = re.findall(rf"[±]?\d+(?:\.\d+)?\s?(?:{unit_pat})", req, flags=re.IGNORECASE)
+    # normalize “within 1 second” to “1 s” if not already captured
+    if re.search(r"\bwithin\s+1\s+second\b", req, flags=re.IGNORECASE):
+        if not any(h.lower().endswith(" s") or h.lower().endswith("s") for h in hits):
+            hits.append("1 s")
+    # normalize common variants
+    norm: List[str] = []
+    for h in hits:
+        hh = h.replace("seconds", "s").replace("second", "s").replace("sec", "s")
+        hh = hh.replace("ohm", "Ω").replace("uA", "µA").replace("uL", "µL")
+        norm.append(hh)
+    # de-dup preserving order
+    out: List[str] = []
+    for x in norm:
+        if x not in out:
+            out.append(x)
+    return out
 
-def _normalize_spec_token(tok: str) -> str:
-    return (tok.replace("seconds", "s")
-              .replace("second", "s")
-              .replace("sec", "s")
-              .replace("Ohm", "Ω")
-              .replace("uA", "µA")
-              .replace("uL", "µL"))
 
 def _rewrite_acceptance(req: str, bullets: str, template: Optional[str]) -> str:
-    """Turn the requirement into a measurable, declarative acceptance statement."""
-    # normalize a few units
-    def _norm(x: str) -> str:
-        return (x.replace("seconds", "s")
-                 .replace("second", "s")
-                 .replace("sec", "s")
-                 .replace("Ohm", "Ω")
-                 .replace("uA", "µA")
-                 .replace("uL", "µL"))
-
-    nums = [_norm(x) for x in _numbers_from_req(req)]
-    t = (req or "").lower()
-
-    # Domain-specific acceptance (air-in-line)
-    if any(k in t for k in AIR_IN_LINE_KEYS):
-        if nums:
-            joined = ", ".join(dict.fromkeys(nums))  # de-dup while preserving order
-            return f"System shall detect air-in-line and annunciate an alarm within the specified limit, meeting {joined} under the defined test setup."
-        return "System shall detect air-in-line and annunciate an alarm within the specified time limit under the defined test setup."
-
-    # Generic numeric acceptance
+    nums = _numbers_from_req(req)
     if nums:
-        joined = ", ".join(dict.fromkeys(nums))
-        return f"System shall comply with the stated requirement under the defined test setup, meeting {joined}."
+        # echo 1–3 key numeric specs from requirement text
+        joined = ", ".join(nums[:3])
+        return f"System shall comply with the stated requirement under the defined test conditions, meeting {joined}."
+    if template and isinstance(template, str) and template.strip():
+        return template.strip()
+    # last resort: compress the requirement
+    req_short = re.sub(r"\s+", " ", req.strip())
+    return f"System shall meet the requirement: {req_short}"
 
-    # Otherwise, use a provided template if it looks real (not a placeholder)
-    if template:
-        temp = template.strip()
-        if temp and not temp.lower().startswith("short line restating"):
-            return temp if temp.endswith(('.', '!', '?')) else (temp + ".")
-
-    # Last resort: compress the requirement itself
-    req_short = re.sub(r"\s+", " ", (req or "").strip())
-    return f"System shall meet the requirement: {req_short}."
 
 def _compose_ctx(req_text: str) -> Tuple[str, Optional[str]]:
     """Retrieve KB bullets and produce a compact context string + acceptance template (if any)."""
-    # Air-in-line deterministic path
-    t = (req_text or "").lower()
-    if any(k in t for k in AIR_IN_LINE_KEYS):
-        bullets = AIR_IN_LINE_BULLETS[:]
-        tmpl = "System shall detect an air-in-line event and alarm within the specified time limit under the defined conditions."
-        return ("\n".join(bullets[:4]), tmpl)
-
     hits = _kb_retrieve(req_text, k=DVP_TOP_K)
     bullets: List[str] = []
-    tmpl: Optional[str] = None
+    tmpl = None
     for h in hits:
         for b in (h.get("bullets") or []):
             if isinstance(b, str) and b.strip():
@@ -436,10 +428,12 @@ def _compose_ctx(req_text: str) -> Tuple[str, Optional[str]]:
             tmpl = h.get("acceptance_template")
         if len(bullets) >= 6:
             break
+    # fallback to heuristic specs if KB empty
     if not bullets:
         for spec in list(_TEST_SPEC_MAP.values())[:3]:
             bullets.append(f"- {spec}")
     return ("\n".join(bullets[:6]) if bullets else "(no context)"), tmpl
+
 
 def _gen_test_block(req: str) -> Dict[str, str]:
     """Generate JSON block using LoRA model + local context, then sanitize."""
@@ -448,6 +442,7 @@ def _gen_test_block(req: str) -> Dict[str, str]:
     ctx, tmpl = _compose_ctx(req)
 
     if _model is None or _tokenizer is None:
+        # fallback when model not available
         fb = [
             "- Test at 3 setpoints; record measured vs setpoint",
             "- Repeatability across 3 cycles; compute deviation",
@@ -462,6 +457,7 @@ def _gen_test_block(req: str) -> Dict[str, str]:
 
     prompt = _PROMPT.format(req=req, ctx=ctx or "(no context)")
     enc = _tokenizer(prompt, return_tensors="pt", truncation=True, max_length=INPUT_MAX, padding=True)
+    # move to model device
     try:
         dev = next(_model.parameters()).device  # type: ignore
         enc = {k: v.to(dev) for k, v in enc.items()}
@@ -487,13 +483,14 @@ def _gen_test_block(req: str) -> Dict[str, str]:
         depth, start = 0, -1
         for i, ch in enumerate(text):
             if ch == "{":
-                if depth == 0: start = i
+                if depth == 0:
+                    start = i
                 depth += 1
             elif ch == "}":
                 if depth > 0:
                     depth -= 1
                     if depth == 0 and start >= 0:
-                        return text[start:i+1]
+                        return text[start:i + 1]
         return None
 
     js = _balanced_json(decoded)
@@ -502,23 +499,25 @@ def _gen_test_block(req: str) -> Dict[str, str]:
     except Exception:
         obj = {}
 
-    bullets = _clean_bullets(obj.get("Test Procedure",""))
-    # If model gave weak bullets and it's air-in-line, force deterministic bullets
-    t = (req or "").lower()
-    if bullets == "TBD" and any(k in t for k in AIR_IN_LINE_KEYS):
-        bullets = "\n".join(AIR_IN_LINE_BULLETS[:4])
+    bullets = _clean_bullets(obj.get("Test Procedure", ""))
 
-    ac = obj.get("Acceptance Criteria","").strip()
-    # If model returned nothing OR a template-y placeholder, rewrite deterministically
+    # If model didn't yield enough steps, synthesize from KB context so UI never sees "TBD"
+    if bullets == "TBD":
+        kb_lines = [ln.strip() for ln in (ctx or "").splitlines() if ln.strip().startswith("- ")]
+        if kb_lines:
+            bullets = "\n".join(kb_lines[:3])
+
+    ac = obj.get("Acceptance Criteria", "").strip()
     if (not ac) or ac.lower().startswith("short line restating"):
         ac = _rewrite_acceptance(req, bullets, tmpl)
 
     return {
-        "Verification Method": str(obj.get("Verification Method","")).strip() or _verification_method(req),
-        "Sample Size": str(obj.get("Sample Size","")).strip() or "30",
-        "Test Procedure": bullets,
-        "Acceptance Criteria": ac,
+        "Verification Method": str(obj.get("Verification Method", "")).strip() or _verification_method(req),
+        "Sample Size": str(obj.get("Sample Size", "")).strip() or "30",
+        "Test Procedure": bullets if bullets else "TBD",
+        "Acceptance Criteria": ac if ac else "TBD",
     }
+
 
 # ================================
 # Public API
@@ -537,17 +536,25 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha_rows: List[Dict[str, Any]
     _load_model()
 
     rows: List[Dict[str, Any]] = []
-    missing_idx = 1  # running IDs for rows missing a VID
+
+    # precompute running IDs for rows missing a VID
+    missing_idx = 1
 
     for r in requirements or []:
         rid = str(r.get("Requirement ID") or r.get("requirement_id") or "").strip()
         vid_in = str(r.get("Verification ID") or r.get("verification_id") or "").strip()
         rtxt = str(r.get("Requirements") or r.get("requirements") or "").strip()
 
-        # Section headers pass-through
-        if rtxt.lower().endswith("requirements") and not vid_in:
+        # Section headers: keep as non-actionable, but still assign a running DV-ID
+        _is_header = rtxt.strip().lower().endswith("requirements")
+        if _is_header:
+            if not vid_in:
+                vid = f"DV-{missing_idx:03d}"
+                missing_idx += 1
+            else:
+                vid = vid_in
             rows.append({
-                "verification_id": "",
+                "verification_id": vid,
                 "requirement_id": rid,
                 "requirements": rtxt,
                 "verification_method": "NA",
@@ -558,7 +565,11 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha_rows: List[Dict[str, Any]
             continue
 
         # Generate running VID if missing
-        vid = vid_in if vid_in else f"DV-{missing_idx:03d}";  missing_idx += (0 if vid_in else 1)
+        if vid_in:
+            vid = vid_in
+        else:
+            vid = f"DV-{missing_idx:03d}"
+            missing_idx += 1
 
         block = _gen_test_block(rtxt)
 
@@ -567,10 +578,10 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha_rows: List[Dict[str, Any]
         sample = _sample_size(rid, ha_rows or [])
 
         merged = {
-            "Verification Method": method or block.get("Verification Method","Inspection"),
-            "Sample Size": sample or block.get("Sample Size","30"),
-            "Test Procedure": block.get("Test Procedure","TBD"),
-            "Acceptance Criteria": block.get("Acceptance Criteria","TBD"),
+            "Verification Method": method or block.get("Verification Method", "Inspection"),
+            "Sample Size": sample or block.get("Sample Size", "30"),
+            "Test Procedure": block.get("Test Procedure", "TBD"),
+            "Acceptance Criteria": block.get("Acceptance Criteria", "TBD"),
         }
 
         cleaned, errors = _guard_validate(merged)
@@ -589,4 +600,5 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha_rows: List[Dict[str, Any]
             "test_procedure": cleaned["Test Procedure"],
             "acceptance_criteria": cleaned["Acceptance Criteria"],
         })
+
     return rows
