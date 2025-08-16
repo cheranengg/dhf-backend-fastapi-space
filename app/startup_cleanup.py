@@ -1,6 +1,9 @@
 # app/startup_cleanup.py
 import os, shutil
 
+for path in ["/data/hf/hub", "/data/hf/transformers", "/data/offload"]:
+    os.makedirs(path, exist_ok=True)
+
 def _safe_rm(path: str):
     try:
         if os.path.isdir(path):
