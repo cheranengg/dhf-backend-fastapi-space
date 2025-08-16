@@ -1,6 +1,6 @@
 # app/models/dvp_infer.py
 from __future__ import annotations
-import os, re, json, random
+import os, re, json
 from typing import List, Dict, Any, Optional, Tuple
 
 # ================================
@@ -28,43 +28,38 @@ DO_SAMPLE   = os.getenv("DVP_DO_SAMPLE", "1") == "1"
 NUM_BEAMS   = int(os.getenv("DVP_NUM_BEAMS", "1"))
 REPETITION_PENALTY = float(os.getenv("DVP_REPETITION_PENALTY", "1.05"))
 
-# local RAG over standards KB
 DVP_RAG_PATH      = os.getenv("DVP_RAG_PATH", "app/rag_sources/standards_kb.jsonl")
 DVP_TOP_K         = int(os.getenv("DVP_TOP_K", "4"))
 DEBUG_DVP         = os.getenv("DEBUG_DVP", "0") == "1"
 
-def _token_cache_kwargs() -> Dict[str, Any]:
+def _tk() -> Dict[str, Any]:
     kw: Dict[str, Any] = {"cache_dir": CACHE_DIR}
-    if HF_TOKEN:
-        kw["token"] = HF_TOKEN
+    if HF_TOKEN: kw["token"] = HF_TOKEN
     return kw
 
 # ================================
-# Guardrails-lite validation
+# Validation (light)
 # ================================
 def _guard_validate(obj: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     errs: List[str] = []
     out = {
-        "Verification Method": str(obj.get("Verification Method","")).strip() or "NA",
-        "Sample Size": str(obj.get("Sample Size","")).strip() or "NA",
-        "Test Procedure": str(obj.get("Test Procedure","")).strip() or "TBD",
-        "Acceptance Criteria": str(obj.get("Acceptance Criteria","")).strip() or "TBD",
+        "Verification Method": (obj.get("Verification Method") or "").strip() or "NA",
+        "Sample Size": (obj.get("Sample Size") or "").strip() or "NA",
+        "Test Procedure": (obj.get("Test Procedure") or "").strip() or "TBD",
+        "Acceptance Criteria": (obj.get("Acceptance Criteria") or "").strip() or "TBD",
     }
-    # only validate when not NA/TBD
-    if out["Verification Method"] not in {"NA", "TBD"}:
+    if out["Verification Method"] not in {"NA","TBD"}:
         if not re.match(r"^[A-Za-z][A-Za-z \-/()]+$", out["Verification Method"]):
             errs.append("Verification Method format invalid")
-    if out["Sample Size"] not in {"NA", "TBD"} and not out["Sample Size"].isdigit():
+    if out["Sample Size"] not in {"NA","TBD"} and not out["Sample Size"].isdigit():
         errs.append("Sample Size must be a number")
-    bullets = [b.strip() for b in out["Test Procedure"].splitlines() if b.strip().startswith("- ")]
-    if out["Test Procedure"] not in {"NA", "TBD"} and not (2 <= len(bullets) <= 6):
+    bullets = [b for b in out["Test Procedure"].splitlines() if b.strip().startswith("- ")]
+    if out["Test Procedure"] not in {"NA","TBD"} and not (2 <= len(bullets) <= 6):
         errs.append("Test Procedure should be 2–6 bullets")
-    if out["Acceptance Criteria"] in ("",):
-        errs.append("Acceptance Criteria missing")
     return out, errs
 
 # ================================
-# Simple standards heuristics (fallback)
+# Small spec map (fallback if KB empty)
 # ================================
 _TEST_SPEC_MAP = {
     "insulation": "Insulation ≥ 50 MΩ at 500 V DC (IEC 60601-1:2012+A1:2020)",
@@ -90,7 +85,7 @@ _TEST_SPEC_MAP = {
 }
 
 # ================================
-# Optional local FAISS retriever
+# KB retriever (FAISS, optional)
 # ================================
 _HAS_RETRIEVAL = False
 try:
@@ -151,30 +146,42 @@ def _init_retriever():
         if DEBUG_DVP:
             print(f"[dvp] KB loaded: {len(_kb_rows)} rows (FAISS off or empty)")
 
-def _kb_retrieve(req_text: str, k: int = DVP_TOP_K) -> List[Dict[str, Any]]:
+def _kb_retrieve(req_text: str, k: int = DVP_TOP_K) -> Tuple[str, Optional[str], List[str]]:
+    """returns (ctx_text, acceptance_template, raw_bullets_list)"""
     _init_retriever()
+    raw_bullets: List[str] = []
+    tmpl: Optional[str] = None
+
     if _index is None or _emb is None or not _kb_rows:
-        hits = []
+        # heuristic fallback
         t = req_text.lower()
         for kw, spec in _TEST_SPEC_MAP.items():
             if kw in t:
-                hits.append({"standard":"heuristic","topic":kw,"test_name":kw,
-                             "bullets":[spec],"acceptance_template":spec})
-        return hits[:k] if hits else [{"standard":"heuristic","topic":"generic",
-                                       "test_name":"Generic Test",
-                                       "bullets":[s for s in list(_TEST_SPEC_MAP.values())[:k]],
-                                       "acceptance_template":"Meets stated specification."}]
+                raw_bullets.append(spec)
+        if not raw_bullets:
+            raw_bullets = list(_TEST_SPEC_MAP.values())[:k]
+        ctx = "\n".join(f"- {b}" for b in raw_bullets[:k])
+        return ctx, "Meets stated specification.", raw_bullets[:k]
+
     qv = _emb.encode([req_text], convert_to_numpy=True)
     n = min(k, len(_kb_texts))
     D, I = _index.search(qv, n)
-    hits: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
     for idx in I[0]:
         if 0 <= idx < len(_kb_rows):
-            hits.append(_kb_rows[idx])
-    return hits
+            rows.append(_kb_rows[idx])
+
+    for h in rows:
+        for b in (h.get("bullets") or []):
+            if isinstance(b, str) and b.strip():
+                raw_bullets.append(b.strip())
+        if not tmpl and isinstance(h.get("acceptance_template"), str):
+            tmpl = h.get("acceptance_template")
+    ctx = "\n".join(f"- {b}" for b in raw_bullets[:k])
+    return ctx, (tmpl or None), raw_bullets[:k]
 
 # ================================
-# Verification method / sample size
+# Methods / sample size
 # ================================
 USABILITY = ["usability", "human factors", "user", "ui", "use error"]
 VISUAL    = ["label", "marking", "display", "color", "symbol"]
@@ -229,27 +236,26 @@ _HEADING_SET = {
     "labeling requirements",
     "sterility requirements",
     "biocompatibility requirements",
-    "biocompatability requirements",  # common typo
+    "biocompatability requirements",
     "packaging requirements",
     "regulatory & interoperability requirements",
     "regulatory and interoperability requirements",
     "human factors & usability",
     "human factors and usability",
 }
-
-_HEADING_RE = re.compile(r"^[A-Za-z ]+requirements?$", re.IGNORECASE)
+_HEADING_RE = re.compile(r"^[\sA-Za-z&]+requirements?$", re.IGNORECASE)
 
 def _is_heading(req_text: str) -> bool:
     t = (req_text or "").strip().lower()
     if t in _HEADING_SET:
         return True
-    # allow short generic “... requirements”
-    if _HEADING_RE.match(t) and len(t.split()) <= 3:
-        return True
+    if "shall" not in t and "must" not in t and "should" not in t:
+        if t.endswith("requirements") or _HEADING_RE.match(t):
+            return True
     return False
 
 # ================================
-# Model loader (prefers _peft_loader)
+# Model loader
 # ================================
 _tokenizer = None
 _model     = None
@@ -288,7 +294,7 @@ def _load_model():
             _logged = True
         return
 
-    # fallback local load (still adapter)
+    # fallback adapter load
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
     try:
@@ -303,7 +309,7 @@ def _load_model():
     except Exception:
         bnb_cfg = None
 
-    tok = AutoTokenizer.from_pretrained(BASE_MODEL_ID, **_token_cache_kwargs())
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL_ID, **_tk())
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -316,11 +322,12 @@ def _load_model():
 
     base = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, **load_kwargs)
     from peft import PeftModel
-    mdl = PeftModel.from_pretrained(base, DVP_ADAPTER_REPO, **_token_cache_kwargs())
+    mdl = PeftModel.from_pretrained(base, DVP_ADAPTER_REPO, **_tk())
     try:
         mdl.config.pad_token_id = tok.pad_token_id  # type: ignore
     except Exception:
         pass
+
     _tokenizer, _model = tok, mdl
     _init_retriever()
     if DEBUG_DVP and not _logged:
@@ -361,8 +368,7 @@ def _clean_bullets(s: str) -> str:
 
 def _numbers_from_req(req: str) -> List[str]:
     unit_pat = r"(mA|µA|uA|V|kV|ms|s|min|h|mL/h|mL|kPa|Pa|%|dB|Ω|Ohm|°C|g|cycles|cm)"
-    hits = re.findall(rf"\d+(?:\.\d+)?\s?{unit_pat}", req)
-    return hits
+    return re.findall(rf"\d+(?:\.\d+)?\s?{unit_pat}", req)
 
 def _rewrite_acceptance(req: str, bullets: str, template: Optional[str]) -> str:
     nums = _numbers_from_req(req)
@@ -374,30 +380,27 @@ def _rewrite_acceptance(req: str, bullets: str, template: Optional[str]) -> str:
         return f"System shall comply with the stated requirement under the defined test conditions, meeting {joined}."
     if template and template.strip():
         return template.strip()
-    req_short = re.sub(r"\s+", " ", req.strip())
-    return f"System shall meet the requirement: {req_short}."
+    return f"System shall meet the requirement: {re.sub(r'\\s+', ' ', req.strip())}."
 
-def _compose_ctx(req_text: str) -> Tuple[str, Optional[str]]:
-    hits = _kb_retrieve(req_text, k=DVP_TOP_K)
-    bullets: List[str] = []
-    tmpl = None
-    for h in hits:
-        for b in (h.get("bullets") or []):
-            if isinstance(b, str) and b.strip():
-                bullets.append(f"- {b.strip()}")
-        if not tmpl and isinstance(h.get("acceptance_template"), str):
-            tmpl = h.get("acceptance_template")
-        if len(bullets) >= 6:
-            break
-    if not bullets:
-        for spec in list(_TEST_SPEC_MAP.values())[:3]:
-            bullets.append(f"- {spec}")
-    return ("\n".join(bullets[:6]) if bullets else "(no context)"), tmpl
+def _synthesize_bullets(req: str, ctx_bullets: List[str]) -> str:
+    """Build 3–4 concrete bullets from context rows if the model returned a template."""
+    picks = [b for b in ctx_bullets if any(ch.isdigit() for ch in b)]
+    if not picks:
+        picks = ctx_bullets[:4]
+    lines: List[str] = []
+    for b in picks[:4]:
+        lines.append(f"- {b}")
+    if len(lines) < 3:
+        # pad with generic measurable steps
+        lines += [
+            "- Test at three setpoints; record measured vs setpoint",
+            "- Repeat for 3 cycles; compute max deviation",
+        ][: 3 - len(lines)]
+    return "\n".join(lines[:4])
 
-def _gen_test_block(req: str) -> Dict[str, str]:
+def _gen_test_block(req: str, ctx: str) -> Dict[str, str]:
     import torch
     _load_model()
-    ctx, tmpl = _compose_ctx(req)
 
     if _model is None or _tokenizer is None:
         fb = [
@@ -409,7 +412,7 @@ def _gen_test_block(req: str) -> Dict[str, str]:
             "Verification Method": _verification_method(req),
             "Sample Size": "30",
             "Test Procedure": "\n".join(fb),
-            "Acceptance Criteria": _rewrite_acceptance(req, "\n".join(fb), tmpl),
+            "Acceptance Criteria": _rewrite_acceptance(req, "\n".join(fb), None),
         }
 
     prompt = _PROMPT.format(req=req, ctx=ctx or "(no context)")
@@ -455,13 +458,11 @@ def _gen_test_block(req: str) -> Dict[str, str]:
         obj = {}
 
     bullets = _clean_bullets(obj.get("Test Procedure",""))
-    ac = obj.get("Acceptance Criteria","").strip()
-    if not ac:
-        ac = _rewrite_acceptance(req, bullets, tmpl)
+    ac = (obj.get("Acceptance Criteria","") or "").strip()
 
     return {
-        "Verification Method": str(obj.get("Verification Method","")).strip() or _verification_method(req),
-        "Sample Size": str(obj.get("Sample Size","")).strip() or "30",
+        "Verification Method": (obj.get("Verification Method") or "").strip() or _verification_method(req),
+        "Sample Size": (obj.get("Sample Size") or "").strip() or "30",
         "Test Procedure": bullets,
         "Acceptance Criteria": ac,
     }
@@ -471,29 +472,30 @@ def _gen_test_block(req: str) -> Dict[str, str]:
 # ================================
 def dvp_predict(requirements: List[Dict[str, Any]], ha_rows: List[Dict[str, Any]]):
     """
-    Inputs per requirement row:
-      - "Requirement ID" (or "requirement_id")
-      - "Verification ID" (or "verification_id") optional
-      - "Requirements"   (text)
+    Inputs:
+      - "Requirement ID" / "requirement_id"
+      - "Verification ID" / "verification_id" (optional)
+      - "Requirements" / "requirements"
 
-    Returns rows with:
+    Output rows:
       - verification_id, requirement_id, requirements
       - verification_method, sample_size, test_procedure, acceptance_criteria
     """
     _load_model()
 
     rows: List[Dict[str, Any]] = []
-    missing_idx = 1  # running numbers for DV-###
+    running = 1
 
     for r in requirements or []:
         rid = str(r.get("Requirement ID") or r.get("requirement_id") or "").strip()
         vid_in = str(r.get("Verification ID") or r.get("verification_id") or "").strip()
         rtxt = str(r.get("Requirements") or r.get("requirements") or "").strip()
 
-        # --- treat section headers as NA across the board, but keep a DV-### id ---
+        # ---- headings → force NA in all right-hand columns ----
         if _is_heading(rtxt):
-            vid = vid_in or f"DV-{missing_idx:03d}"
-            missing_idx += 1
+            vid = vid_in or f"DV-{running:03d}"
+            if not vid_in:
+                running += 1
             rows.append({
                 "verification_id": vid,
                 "requirement_id": rid,
@@ -505,31 +507,37 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha_rows: List[Dict[str, Any]
             })
             continue
 
-        # Generate a DV id if missing
-        vid = vid_in or f"DV-{missing_idx:03d}"
+        vid = vid_in or f"DV-{running:03d}"
         if not vid_in:
-            missing_idx += 1
+            running += 1
 
-        # model + RAG block
-        block = _gen_test_block(rtxt)
+        # context from KB once; use it both for prompting and fallback synthesis
+        ctx_text, tmpl, ctx_bullets = _kb_retrieve(rtxt, k=DVP_TOP_K)
 
-        # deterministic method & sample based on text + HA
-        method = _verification_method(rtxt)
-        sample = _sample_size(rid, ha_rows or [])
+        block = _gen_test_block(rtxt, ctx_text)
+
+        # Override with deterministic method/sample from text + HA
+        method = _verification_method(rtxt) or block["Verification Method"]
+        sample = _sample_size(rid, ha_rows or []) or block["Sample Size"]
+
+        test_proc = block["Test Procedure"]
+        acc = block["Acceptance Criteria"]
+
+        # ---- fix placeholders leaked by the model ----
+        if not test_proc or test_proc == "TBD" or "2-6 bullet points" in test_proc.lower():
+            test_proc = _synthesize_bullets(rtxt, ctx_bullets)
+
+        if (not acc or "short line restating" in acc.lower()):
+            acc = _rewrite_acceptance(rtxt, test_proc, tmpl)
 
         merged = {
-            "Verification Method": method or block.get("Verification Method","Inspection"),
-            "Sample Size": sample or block.get("Sample Size","30"),
-            "Test Procedure": block.get("Test Procedure","TBD"),
-            "Acceptance Criteria": block.get("Acceptance Criteria","TBD"),
+            "Verification Method": method or "Inspection",
+            "Sample Size": sample or "30",
+            "Test Procedure": test_proc or "TBD",
+            "Acceptance Criteria": acc or "TBD",
         }
 
-        cleaned, errors = _guard_validate(merged)
-        if DEBUG_DVP:
-            try:
-                print({"rid": rid, "vid": vid, "errors": errors})
-            except Exception:
-                pass
+        cleaned, _ = _guard_validate(merged)
 
         rows.append({
             "verification_id": vid,
