@@ -19,7 +19,7 @@ except Exception:
 # -------------------------------------------------------------------
 ENABLE_DVP   = os.getenv("ENABLE_DVP", "1") == "1"
 ENABLE_TM    = os.getenv("ENABLE_TM",  "0") == "1"   # start disabled until ready
-MAX_REQS     = int(os.getenv("MAX_REQS", "5"))
+MAX_REQS     = int(os.getenv("MAX_REQS", "50"))
 QUICK_LIMIT  = int(os.getenv("QUICK_LIMIT", "0"))    # 0 = off; >0 caps rows for quick tests
 BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "devtoken")
 
