@@ -381,22 +381,40 @@ def _normalize_spec_token(tok: str) -> str:
               .replace("uL", "µL"))
 
 def _rewrite_acceptance(req: str, bullets: str, template: Optional[str]) -> str:
-    nums = [_normalize_spec_token(x) for x in _numbers_from_req(req)]
+    """Turn the requirement into a measurable, declarative acceptance statement."""
+    # normalize a few units
+    def _norm(x: str) -> str:
+        return (x.replace("seconds", "s")
+                 .replace("second", "s")
+                 .replace("sec", "s")
+                 .replace("Ohm", "Ω")
+                 .replace("uA", "µA")
+                 .replace("uL", "µL"))
+
+    nums = [_norm(x) for x in _numbers_from_req(req)]
+    t = (req or "").lower()
+
+    # Domain-specific acceptance (air-in-line)
+    if any(k in t for k in AIR_IN_LINE_KEYS):
+        if nums:
+            joined = ", ".join(dict.fromkeys(nums))  # de-dup while preserving order
+            return f"System shall detect air-in-line and annunciate an alarm within the specified limit, meeting {joined} under the defined test setup."
+        return "System shall detect air-in-line and annunciate an alarm within the specified time limit under the defined test setup."
+
+    # Generic numeric acceptance
     if nums:
-        uniq: List[str] = []
-        for n in nums:
-            if n not in uniq:
-                uniq.append(n)
-        joined = ", ".join(uniq[:4])
-        text = f"System shall detect and alarm for the condition under the defined test setup, meeting {joined}."
-    elif template and template.strip():
-        text = template.strip()
-        if not text.endswith(('.', '!', '?')):
-            text += "."
-    else:
-        req_short = re.sub(r"\s+", " ", (req or "").strip())
-        text = f"System shall meet the requirement: {req_short}."
-    return text
+        joined = ", ".join(dict.fromkeys(nums))
+        return f"System shall comply with the stated requirement under the defined test setup, meeting {joined}."
+
+    # Otherwise, use a provided template if it looks real (not a placeholder)
+    if template:
+        temp = template.strip()
+        if temp and not temp.lower().startswith("short line restating"):
+            return temp if temp.endswith(('.', '!', '?')) else (temp + ".")
+
+    # Last resort: compress the requirement itself
+    req_short = re.sub(r"\s+", " ", (req or "").strip())
+    return f"System shall meet the requirement: {req_short}."
 
 def _compose_ctx(req_text: str) -> Tuple[str, Optional[str]]:
     """Retrieve KB bullets and produce a compact context string + acceptance template (if any)."""
@@ -491,7 +509,8 @@ def _gen_test_block(req: str) -> Dict[str, str]:
         bullets = "\n".join(AIR_IN_LINE_BULLETS[:4])
 
     ac = obj.get("Acceptance Criteria","").strip()
-    if not ac:
+    # If model returned nothing OR a template-y placeholder, rewrite deterministically
+    if (not ac) or ac.lower().startswith("short line restating"):
         ac = _rewrite_acceptance(req, bullets, tmpl)
 
     return {
