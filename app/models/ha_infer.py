@@ -36,19 +36,19 @@ REPETITION_PENALTY: float = float(os.getenv("HA_REPETITION_PENALTY", "1.05"))
 # Safety / speed
 FORCE_CPU: bool = os.getenv("FORCE_CPU", "0") == "1"
 OFFLOAD_DIR: str = os.getenv("OFFLOAD_DIR", "/tmp/offload")
-CACHE_DIR: str = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/hf"
+CACHE_DIR: str = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/hf")
 
 # Input length cap for the prompt (prevents OOM on long requirements + context)
 HA_INPUT_MAX_TOKENS: int = int(os.getenv("HA_INPUT_MAX_TOKENS", "512"))
 
-# Optional paraphrase control to avoid verbatim copies from RAG
+# Paraphrase control to avoid verbatim copies from RAG
 PARAPHRASE_FROM_RAG: bool = os.getenv("PARAPHRASE_FROM_RAG", "1") == "1"
 PARAPHRASE_MAX_WORDS: int = int(os.getenv("PARAPHRASE_MAX_WORDS", "22"))
 
 # Cap rows defensively (backend already caps)
 ROW_LIMIT: int = int(os.getenv("HA_ROW_LIMIT", "50"))
 
-# Debug logging controls
+# Debug
 DEBUG_HA: bool = os.getenv("DEBUG_HA", "1") == "1"
 DEBUG_PEEK_CHARS: int = int(os.getenv("DEBUG_PEEK_CHARS", "320"))
 
@@ -57,112 +57,95 @@ DEBUG_PEEK_CHARS: int = int(os.getenv("DEBUG_PEEK_CHARS", "320"))
 # ---------------------------
 _tokenizer = None
 _model = None
-_RAG_DB: List[Dict[str, Any]] = []      # generic RAG rows
-_MAUDE_ROWS: List[Dict[str, Any]] = []  # parsed local MAUDE jsonl (fast)
+_RAG_DB: List[Dict[str, Any]] = []
+_MAUDE_ROWS: List[Dict[str, Any]] = []
 _logged_model_banner = False
 
-# =====================================================
-# NEW: fixed infusion-pump Risk to Health choices + harms
-# =====================================================
+# ---------------------------
+# Controlled vocab
+# ---------------------------
 RISK_TO_HEALTH_CHOICES = [
-    "Air Embolism", "Allergic response", "Delay of therapy", "Environmental Hazard",
-    "Incorrect Therapy", "Infection", "Overdose", "Particulate", "Trauma", "Underdose"
+    "Air Embolism",
+    "Allergic response",
+    "Delay of therapy",
+    "Environmental Hazard",
+    "Incorrect Therapy",
+    "Infection",
+    "Overdose",
+    "Particulate",
+    "Trauma",
+    "Underdose",
 ]
 
-HARM_CATALOG: Dict[str, List[str]] = {
-    "Air Embolism": ["Pulmonary Embolism", "Shortness of breath", "Stroke", "Death"],
-    "Allergic response": ["Allergic reaction (Systemic / Localized)", "Severe Injury"],
-    "Delay of therapy": ["Disease Progression", "Severe Injury"],
-    "Environmental Hazard": ["Chemical burns", "Toxic effects"],
-    "Incorrect Therapy": [
-        "Hypertension", "Hypotension", "Cardiac Arrhythmia", "Seizure", "Organ Failure"
+HARM_BY_RTH = {
+    "Air Embolism": [
+        "Pulmonary Embolism", "Stroke", "Shortness of breath", "Severe Injury", "Death"
     ],
-    "Infection": ["Sepsis", "Severe Septic Shock", "Cellulitis"],
-    "Overdose": ["Toxic effects", "Organ damage", "Seizure", "Hypertension", "Cardiac Arrhythmia"],
-    "Particulate": ["Pulmonary Embolism", "Stroke"],
-    "Trauma": ["Severe Injury", "Organ damage"],
-    "Underdose": ["Disease Progression", "Organ Failure"],
+    "Allergic response": [
+        "Allergic reaction (Systemic / Localized)", "Toxic effects", "Severe Injury"
+    ],
+    "Delay of therapy": [
+        "Disease Progression", "Severe Injury", "Death"
+    ],
+    "Environmental Hazard": [
+        "Toxic effects", "Chemical burns", "Severe Injury"
+    ],
+    "Incorrect Therapy": [
+        "Hypertension", "Hypotension", "Cardiac Arrhythmia",
+        "Tachycardia", "Bradycardia", "Seizure", "Organ damage"
+    ],
+    "Infection": [
+        "Sepsis", "Cellulitis", "Severe Septic Shock"
+    ],
+    "Overdose": [
+        "Organ Failure", "Cardiac Arrhythmia", "Toxic effects"
+    ],
+    "Underdose": [
+        "Progression of untreated condition", "Severe Injury"
+    ],
+    "Particulate": [
+        "Embolism", "Organ damage", "Severe Injury"
+    ],
+    "Trauma": [
+        "Severe Injury", "Organ damage", "Bradycardia"
+    ],
 }
 
-def choose_harm(risk_to_health: str, hazard: str, hs: str) -> str:
-    """Pick a patient-centric harm from the catalog using simple cues."""
-    r = (risk_to_health or "").strip()
-    hazard_l = (hazard or "").lower()
-    hs_l = (hs or "").lower()
-    options = HARM_CATALOG.get(r) or ["Severe Injury"]
-
-    # bias selection using hazard / HS keywords
-    def pick(pref: List[str]) -> Optional[str]:
-        for p in pref:
-            if p in options:
-                return p
-        return None
-
-    if "air" in hazard_l or "air-in-line" in hazard_l or "bubble" in hs_l:
-        return pick(["Pulmonary Embolism", "Shortness of breath"]) or options[0]
-    if "occlusion" in hazard_l or "restriction" in hs_l:
-        return pick(["Therapy interruption or incorrect dose"]) or options[0]
-    if any(k in hazard_l for k in ["flow", "dose", "accuracy"]) or "incorrect volume" in hs_l:
-        return pick(["Hypertension", "Hypotension", "Seizure"]) or options[0]
-    if any(k in hazard_l for k in ["shock", "drop", "impact", "vibration"]):
-        return pick(["Severe Injury"]) or options[0]
-    if any(k in hazard_l for k in ["infection", "contamination"]):
-        return pick(["Sepsis", "Cellulitis"]) or options[0]
-    if "particulate" in hazard_l:
-        return pick(["Pulmonary Embolism", "Stroke"]) or options[0]
-    return options[0]
-
-# =====================================================
-# NEW: specific risk-control suggestions (with standards)
-# =====================================================
-def _pp(s: str) -> str:
-    """tiny paraphraser to avoid repeating exact strings."""
-    return (s.replace("ensure", "make sure")
-             .replace("shall", "must")
-             .replace("verify", "confirm")
-             .replace("verification", "confirmation"))
-
-def suggest_control(req_text: str, hazard: str, rth: str) -> str:
-    t = f"{req_text} {hazard}".lower()
-
-    # standards / themes
-    if any(k in t for k in ["flow", "accuracy"]):
-        return _pp("Flow calibration; confirmation per IEC 60601-2-24; closed-loop checks and drift limits")
-    if "occlusion" in t:
-        return _pp("Occlusion detection with alarm; trip thresholds verified per IEC 60601-2-24")
-    if any(k in t for k in ["air-in-line", "air in line", "bubble"]):
-        return _pp("Air-in-line detector with alarm; purge / priming procedure in IFU")
-    if any(k in t for k in ["leakage", "patient leakage"]):
-        return _pp("Patient leakage current test per IEC 60601-1; periodic production checks")
-    if any(k in t for k in ["dielectric", "hi-pot", "hipot"]):
-        return _pp("Dielectric strength test per IEC 60601-1; insulation design review")
-    if "insulation resistance" in t or "insulation" in t:
-        return _pp("Insulation resistance ≥50 MΩ at 500 V DC per IEC 60601-1")
-    if "earth" in t or "protective earth" in t:
-        return _pp("Protective earth continuity ≤0.1 Ω at 25 A per IEC 60601-1")
-    if "alarm" in t:
-        return _pp("Alarm design and audibility per IEC 60601-1-8; tone mapping and response-time verification")
-    if any(k in t for k in ["emc", "emission", "immunity", "esd", "radiated"]):
-        return _pp("EMC compliance per IEC 60601-1-2 (emissions + immunity test plan and confirmation)")
-    if "ip" in t or "ingress" in t:
-        return _pp("Ingress protection per IEC 60529 (targeted IP rating) with orientation tests")
-    if any(k in t for k in ["drop", "shock", "impact", "vibration"]):
-        return _pp("Rough-handling/mechanical tests per IEC 60068 and IEC 60601-1; post-test functional check")
-    if "battery" in t:
-        return _pp("Battery safety per IEC 62133-2 and IEC 60601-1; charge/short-circuit protections and tests")
-    if any(k in t for k in ["usability", "human factors", "use error", "ui"]):
-        return _pp("Usability validation per IEC 62366-1 with representative users; mitigations in design/IFU")
-    if "software" in t:
-        return _pp("Software lifecycle controls per IEC 62304; unit/integration verification and traceability")
-    if any(k in t for k in ["label", "marking", "symbol"]):
-        return _pp("Labeling per ISO 15223-1; permanence/legibility checks and IFU clarity review")
-    if any(k in t for k in ["luer", "connector"]):
-        return _pp("Small-bore connector conformity per ISO 80369-7; leakage and mis-connection prevention")
-    if "temperature rise" in t or "clause 11" in t:
-        return _pp("Temperature rise tests per IEC 60601-1 Clause 11; monitoring of accessible parts")
-
-    # fallback — still a bit more specific than the old generic
-    return _pp("Design controls with targeted tests to the applicable IEC/ISO clause; alarms and IFU warnings")
+# requirement → (hazard, hazardous_situation, risk_to_health)
+REQ_TO_HA_PATTERNS = [
+    (["air-in-line", "air in line", "bubble", "air detection"],
+     ("Air-in-line not detected", "Patient receives air", "Air Embolism")),
+    (["occlusion", "blockage", "line occlusion"],
+     ("Line occlusion", "Flow restricted during therapy", "Delay of therapy")),
+    (["flow", "accuracy", "rate"],
+     ("Inaccurate flow rate", "Incorrect volume delivered", "Incorrect Therapy")),
+    (["leakage current", "patient leakage"],
+     ("Electrical leakage", "Patient contacted by leakage current", "Trauma")),
+    (["dielectric", "hi-pot", "hipot"],
+     ("Insulation breakdown", "Breakdown under high potential", "Trauma")),
+    (["insulation resistance", "insulation"],
+     ("Insulation degradation", "Compromised insulation", "Trauma")),
+    (["protective earth", "earth continuity"],
+     ("Protective earth failure", "Accessible parts not bonded", "Trauma")),
+    (["alarm"],
+     ("Alarm failure", "Alarm not triggered or inaudible", "Delay of therapy")),
+    (["emc", "immunity", "emission", "esd", "radiated", "conducted"],
+     ("Electromagnetic interference", "Device behavior affected by EM field", "Incorrect Therapy")),
+    (["ip", "ingress", "water", "drip"],
+     ("Liquid ingress", "Moisture enters enclosure", "Incorrect Therapy")),
+    (["drop", "shock", "impact", "vibration"],
+     ("Mechanical shock/vibration", "Component/connection damage", "Trauma")),
+    (["battery", "power", "shutdown"],
+     ("Battery failure", "Unexpected shutdown", "Delay of therapy")),
+    (["usability", "human factors", "ui", "use error", "lockout"],
+     ("Use error", "User action leads to incorrect setup", "Incorrect Therapy")),
+    (["label", "marking", "symbol", "udi"],
+     ("Labeling error", "User misinterprets label/IFU", "Incorrect Therapy")),
+    (["luer", "connector", "80369"],
+     ("Misconnection", "Wrong small-bore connection", "Incorrect Therapy")),
+    (["temperature rise", "clause 11", "overheating"],
+     ("Overheating", "Accessible parts exceed safe temp", "Trauma")),
+]
 
 # ---------------------------
 # Utilities
@@ -186,16 +169,13 @@ def _jsonl_load(path: str) -> List[Dict[str, Any]]:
 
 def _maybe_truncate_words(s: str, max_words: int) -> str:
     toks = re.split(r"\s+", s.strip())
-    if len(toks) <= max_words:
-        return s.strip()
-    return " ".join(toks[:max_words]).strip()
+    return s.strip() if len(toks) <= max_words else " ".join(toks[:max_words]).strip()
 
 def _paraphrase_sentence(s: str) -> str:
     out = s.strip()
-    out = out.replace("shall", "must").replace("patient", "the patient").replace("device", "system")
-    out = out.replace("ensure", "make sure").replace("maintain", "keep")
-    out = _maybe_truncate_words(out, PARAPHRASE_MAX_WORDS)
-    return out
+    out = out.replace("shall", "must").replace("device", "system").replace("ensure", "make sure")
+    out = out.replace("maintain", "keep").replace("patient", "the patient")
+    return _maybe_truncate_words(out, PARAPHRASE_MAX_WORDS)
 
 def _gc_cuda():
     try:
@@ -219,7 +199,7 @@ def _log_once_banner(extra: str = ""):
     )
 
 # ---------------------------
-# Model loader (explicit 4-bit if available)
+# Model loader
 # ---------------------------
 def _load_model():
     global _tokenizer, _model
@@ -230,15 +210,11 @@ def _load_model():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     device_map = "auto" if (torch.cuda.is_available() and not FORCE_CPU) else None
-    want_cuda = (device_map == "auto")
+    want_cuda = device_map == "auto"
+    dtype = torch.bfloat16 if (want_cuda and hasattr(torch, "bfloat16")) else (torch.float16 if want_cuda else torch.float32)
+
     bnb_ok = False
     bnb_cfg = None
-    dtype = torch.float16
-    if want_cuda:
-        dtype = torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
-    else:
-        dtype = torch.float32
-
     try:
         from transformers import BitsAndBytesConfig
         bnb_ok = True
@@ -258,19 +234,11 @@ def _load_model():
     load_kwargs = dict(cache_dir=CACHE_DIR, low_cpu_mem_usage=True)
     if want_cuda:
         load_kwargs.update(dict(device_map="auto", torch_dtype=dtype, offload_folder=OFFLOAD_DIR))
+    if bnb_ok and want_cuda:
+        load_kwargs.update(dict(quantization_config=bnb_cfg))
 
     try:
-        if bnb_ok and want_cuda:
-            load_kwargs.update(dict(quantization_config=bnb_cfg))
-            print("[ha] loading base in 4-bit...")
-            base = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, **load_kwargs)
-        elif want_cuda:
-            print("[ha] bitsandbytes not available → loading half on GPU...")
-            base = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, **load_kwargs)
-        else:
-            print("[ha] GPU not available/forced CPU → loading on CPU fp32...")
-            base = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, **load_kwargs)
-
+        base = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, **load_kwargs)
         if USE_HA_ADAPTER:
             from peft import PeftModel
             _model = PeftModel.from_pretrained(base, HA_ADAPTER_REPO, cache_dir=CACHE_DIR)
@@ -292,11 +260,11 @@ def _load_model():
 
     except Exception as e:
         _gc_cuda()
-        print(f"[ha] WARNING: GPU/4-bit load failed → falling back to CPU fp32. err={e}")
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        print(f"[ha] WARNING: GPU/4-bit load failed → CPU fallback. err={e}")
         _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, cache_dir=CACHE_DIR)
         if _tokenizer.pad_token is None:
             _tokenizer.pad_token = _tokenizer.eos_token
+        from transformers import AutoModelForCausalLM
         _model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, cache_dir=CACHE_DIR)
         try:
             _model.config.pad_token_id = _tokenizer.pad_token_id
@@ -307,7 +275,7 @@ def _load_model():
             print("[ha] model loaded on CPU (fallback).")
 
 # ---------------------------
-# RAG + MAUDE loaders
+# RAG + MAUDE
 # ---------------------------
 def _load_rag_once():
     global _RAG_DB
@@ -315,7 +283,7 @@ def _load_rag_once():
         return
     _RAG_DB = _jsonl_load(HA_RAG_PATH)
     if DEBUG_HA:
-        print(f"[ha] RAG loaded: {len(_RAG_DB)} rows from {HA_RAG_PATH}")
+        print(f"[ha] RAG loaded: {len(_RAG_DB)} rows")
 
 def _load_maude_once():
     global _MAUDE_ROWS
@@ -323,18 +291,18 @@ def _load_maude_once():
         return
     _MAUDE_ROWS = _jsonl_load(MAUDE_LOCAL_PATH)
     if DEBUG_HA:
-        print(f"[ha] MAUDE loaded: {len(_MAUDE_ROWS)} rows from {MAUDE_LOCAL_PATH}")
+        print(f"[ha] MAUDE loaded: {len(_MAUDE_ROWS)} rows")
 
 def _pick_rag_seed() -> Optional[str]:
     if not _RAG_DB:
         return None
-    candidate_fields = [
-        "Hazard", "hazard", "risk_to_health", "Risk to Health", "hazardous_situation", "Hazardous Situation",
-        "harm", "Harm", "text", "event_text", "event_description", "device_problem_text",
+    fields = [
+        "Hazard","hazard","risk_to_health","Risk to Health","hazardous_situation","Hazardous Situation",
+        "harm","Harm","text","event_text","event_description","device_problem_text",
     ]
     for _ in range(12):
         row = random.choice(_RAG_DB)
-        for k in candidate_fields:
+        for k in fields:
             v = row.get(k)
             if isinstance(v, str) and len(v.strip()) > 8:
                 return _maybe_truncate_words(v.strip(), PARAPHRASE_MAX_WORDS + 6)
@@ -367,22 +335,22 @@ def _maude_snippets(k: int = 6) -> List[str]:
     return keep
 
 # ---------------------------
-# Prompt + generation
+# Prompt
 # ---------------------------
 _SCHEMA = """
 Return a compact JSON object with keys:
-- "risk_id": a unique id like "HA-####"
-- "risk_to_health": short phrase (e.g., "Air Embolism")
-- "hazard": short phrase
-- "hazardous_situation": short phrase
-- "harm": short phrase
-- "sequence_of_events": short phrase
-- "severity_of_harm": one of "1","2","3","4","5"
-- "p0": one of "Very Low","Low","Medium","High","Very High"
+- "risk_id": id like "HA-####" (optional)
+- "risk_to_health": phrase
+- "hazard": phrase
+- "hazardous_situation": phrase
+- "harm": phrase (patient-impacting)
+- "sequence_of_events": phrase
+- "severity_of_harm": "1".."5"
+- "p0": "Very Low"|"Low"|"Medium"|"High"|"Very High"
 - "p1": same scale
 - "poh": same scale
-- "risk_index": one of "Low","Medium","High","Very High"
-- "risk_control": succinct preventive/mitigating statement; do NOT mention requirement IDs.
+- "risk_index": "Low"|"Medium"|"High"|"Very High"
+- "risk_control": short preventive/mitigating statement
 """
 
 def _build_prompt(req_text: str, rag_seed: Optional[str], maude_bits: List[str]) -> str:
@@ -397,13 +365,14 @@ def _build_prompt(req_text: str, rag_seed: Optional[str], maude_bits: List[str])
 Requirement: {req_text}
 
 Use professional language. Prefer concise phrases.
-If some items truly cannot be inferred, pick reasonable, generic infusion-pump patterns.
+If some items truly cannot be inferred, leave them blank.
 
 {_SCHEMA}
 
 {context}
 
-Now output ONLY the JSON:"""
+Now output ONLY the JSON:
+"""
 
 def _decode_json_from_text(txt: str) -> Dict[str, Any]:
     m = re.search(r"\{.*\}", txt, re.DOTALL)
@@ -441,47 +410,104 @@ def _generate_json(prompt: str) -> Dict[str, Any]:
         )
     txt = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
     if DEBUG_HA:
-        peek = txt[:DEBUG_PEEK_CHARS].replace("\n", " ")
-        print(f"[ha] output peek: {peek} ...")
+        print(f"[ha] output peek: {txt[:DEBUG_PEEK_CHARS].replace(chr(10),' ')} ...")
     return _decode_json_from_text(txt)
 
 # ---------------------------
-# Post processing / defaults
+# Inference helpers
 # ---------------------------
-def _ensure_fields(d: Dict[str, Any]) -> Dict[str, Any]:
-    def s(k, default="TBD"):
-        v = d.get(k)
-        return str(v).strip() if v is not None and str(v).strip() else default
+def infer_from_requirement(req_text: str) -> Dict[str, str]:
+    t = (req_text or "").lower()
+    for keys, (haz, hs, rth) in REQ_TO_HA_PATTERNS:
+        if any(k in t for k in keys):
+            return {
+                "hazard": haz,
+                "hazardous_situation": hs,
+                "risk_to_health": rth,
+                "sequence_of_events": "Design or use condition triggers the stated hazard",
+            }
+    return {"hazard": "", "hazardous_situation": "", "risk_to_health": "", "sequence_of_events": ""}
 
-    # constrain risk_to_health to the fixed list if model wanders
-    rth = s("risk_to_health", "Incorrect Therapy")
-    if rth not in RISK_TO_HEALTH_CHOICES:
-        # try to map by keyword
-        rlow = rth.lower()
+def choose_harm(risk_to_health: str, hazard: str, hs: str) -> str:
+    rth = risk_to_health if risk_to_health in HARM_BY_RTH else "Incorrect Therapy"
+    choices = HARM_BY_RTH.get(rth, ["Severe Injury"])
+    # bias selection using keywords
+    txt = f"{hazard} {hs}".lower()
+    if "pressure" in txt or "occlusion" in txt:
+        return "Hypertension"
+    if "air" in txt:
+        return "Pulmonary Embolism"
+    if "label" in txt or "use error" in txt:
+        return "Incorrect Therapy" if "Incorrect Therapy" in RISK_TO_HEALTH_CHOICES else random.choice(choices)
+    return random.choice(choices)
+
+def suggest_control(req_text: str, hazard: str, risk_to_health: str) -> str:
+    t = (req_text or "").lower()
+    if any(k in t for k in ["flow", "accuracy", "rate"]):
+        return "Flow calibration; verification per IEC 60601-2-24"
+    if any(k in t for k in ["air-in-line", "air in line", "bubble"]):
+        return "Air-in-line detector with alarm; purge procedures"
+    if any(k in t for k in ["occlusion", "blockage"]):
+        return "Occlusion detection with alarms; tubing inspection"
+    if any(k in t for k in ["leakage current"]):
+        return "Patient leakage tests per IEC 60601-1"
+    if any(k in t for k in ["dielectric", "hipot", "hi-pot"]):
+        return "Dielectric withstand per IEC 60601-1"
+    if any(k in t for k in ["insulation resistance"]):
+        return "Insulation resistance per IEC 60601-1"
+    if any(k in t for k in ["protective earth", "earth continuity"]):
+        return "Protective earth continuity per IEC 60601-1"
+    if any(k in t for k in ["emc", "immunity", "emission", "esd"]):
+        return "EMC compliance per IEC 60601-1-2 (ed.4.1)"
+    if any(k in t for k in ["ip", "ingress", "drip"]):
+        return "Ingress protection per IEC 60529 (e.g., IP2X/IPX2)"
+    if any(k in t for k in ["drop", "shock", "impact"]):
+        return "Rough handling/impact tests per IEC 60601-1"
+    if any(k in t for k in ["vibration"]):
+        return "Vibration test per IEC 60068-2-6"
+    if any(k in t for k in ["battery", "power", "shutdown"]):
+        return "Battery safety per IEC 62133-2; backup & alarms"
+    if any(k in t for k in ["usability", "human factors", "lockout"]):
+        return "Usability validation per IEC 62366; lockout verified"
+    if any(k in t for k in ["label", "symbol", "udi"]):
+        return "Labels per ISO 15223-1; UDI & warnings verified"
+    if any(k in t for k in ["luer", "connector", "80369"]):
+        return "Small-bore connections per ISO 80369-7"
+    if any(k in t for k in ["temperature rise", "clause 11", "overheating"]):
+        return "Temperature rise test per IEC 60601-1, Cl.11"
+    # generic but still specific
+    return "Design controls, alarms, verification, and labeling per applicable standards"
+
+def _ensure_fields(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Light normalization only; no aggressive defaulting (prevents repetition)."""
+    def s(k):
+        v = d.get(k)
+        return str(v).strip() if v is not None and str(v).strip() else ""
+
+    rth = s("risk_to_health")
+    if rth and rth not in RISK_TO_HEALTH_CHOICES:
+        rl = rth.lower()
         for choice in RISK_TO_HEALTH_CHOICES:
-            if choice.split()[0].lower() in rlow:
+            if choice.split()[0].lower() in rl:
                 rth = choice
                 break
-        else:
-            rth = "Incorrect Therapy"
 
     out = {
         "risk_id": s("risk_id"),
         "risk_to_health": rth,
-        "hazard": s("hazard", "Device malfunction"),
-        "hazardous_situation": s("hazardous_situation", "Patient exposed to device fault"),
-        "harm": s("harm", "Severe Injury"),
-        "sequence_of_events": s("sequence_of_events", "Design or use issue leads to hazardous condition"),
-        "severity_of_harm": s("severity_of_harm", "3"),
-        "p0": s("p0", "Medium"),
-        "p1": s("p1", "Medium"),
-        "poh": s("poh", "Low"),
-        "risk_index": s("risk_index", "Medium"),
-        "risk_control": s("risk_control", "Design controls with tests and IFU warnings"),
+        "hazard": s("hazard"),
+        "hazardous_situation": s("hazardous_situation"),
+        "harm": s("harm"),
+        "sequence_of_events": s("sequence_of_events"),
+        "severity_of_harm": s("severity_of_harm"),
+        "p0": s("p0"),
+        "p1": s("p1"),
+        "poh": s("poh"),
+        "risk_index": s("risk_index"),
+        "risk_control": s("risk_control"),
     }
 
-    # normalize severity / scales
-    if not re.fullmatch(r"[1-5]", out["severity_of_harm"]):
+    if not re.fullmatch(r"[1-5]", out["severity_of_harm"] or ""):
         out["severity_of_harm"] = "3"
     for k in ("p0", "p1", "poh"):
         if out[k] not in {"Very Low", "Low", "Medium", "High", "Very High"}:
@@ -496,9 +522,9 @@ def _ensure_fields(d: Dict[str, Any]) -> Dict[str, Any]:
 def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Input: [{"Requirement ID": "...", "Requirements": "..."} ...]
-    Output rows with keys:
-      requirement_id, risk_id, risk_to_health, hazard, hazardous_situation, harm,
-      sequence_of_events, severity_of_harm, p0, p1, poh, risk_index, risk_control
+    Returns rows (we keep requirement_id so DVP/TM can join):
+      - requirement_id, risk_id, risk_to_health, hazard, hazardous_situation,
+        harm, sequence_of_events, severity_of_harm, p0, p1, poh, risk_index, risk_control
     """
     _load_rag_once()
     _load_maude_once()
@@ -508,11 +534,10 @@ def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return rows
 
     reqs = requirements[:ROW_LIMIT]
-
-    running_idx = 1  # for HA-001, HA-002, ...
+    running_idx = 1
 
     for r in reqs:
-        rid = str(r.get("Requirement ID") or r.get("requirement_id") or "").strip() or "REQ-XXX"
+        rid = str(r.get("Requirement ID") or r.get("requirement_id") or "").strip() or f"REQ-{running_idx:03d}"
         req_text = str(r.get("Requirements") or r.get("requirements") or "").strip()
 
         rag_seed = _pick_rag_seed()
@@ -530,16 +555,37 @@ def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         data = _ensure_fields(raw)
 
-        # enforce sequential HA IDs
+        # Sequential HA IDs
         data["risk_id"] = f"HA-{running_idx:03d}"
         running_idx += 1
 
-        # compute patient-centric harm & better control
+        # 1) Requirement-driven inference fills blanks (prevents copy-paste defaults)
+        inferred = infer_from_requirement(req_text)
+        for k in ("hazard", "hazardous_situation", "risk_to_health", "sequence_of_events"):
+            if not data[k]:
+                data[k] = inferred[k]
+
+        # 2) Constrain Risk to Health; fallback if still empty
+        if not data["risk_to_health"]:
+            data["risk_to_health"] = "Incorrect Therapy"
+
+        # 3) Minimal generic fallback only for still-empty cells
+        if not data["hazard"]:
+            data["hazard"] = "Device malfunction"
+        if not data["hazardous_situation"]:
+            data["hazardous_situation"] = "Patient exposed to device fault"
+        if not data["sequence_of_events"]:
+            data["sequence_of_events"] = "Design or use issue leads to hazardous condition"
+
+        # 4) Patient-centric harm
         data["harm"] = choose_harm(data["risk_to_health"], data["hazard"], data["hazardous_situation"])
-        data["risk_control"] = suggest_control(req_text, data["hazard"], data["risk_to_health"])
+
+        # 5) Specific control aligned with requirement/hazard
+        data["risk_control"] = suggest_control(req_text, data["hazard"], data["risk_to_health"]) or data["risk_control"] or \
+            "Design controls, alarms, verification, and labeling per applicable standards"
 
         rows.append({
-            "requirement_id": rid,              # keep in payload; UI can hide if desired
+            "requirement_id": rid,
             "risk_id": data["risk_id"],
             "risk_to_health": data["risk_to_health"],
             "hazard": data["hazard"],
