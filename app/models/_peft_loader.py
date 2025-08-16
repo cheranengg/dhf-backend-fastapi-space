@@ -3,6 +3,11 @@ from __future__ import annotations
 import os
 from typing import Optional, Dict, Any
 
+CACHE_DIR   = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/data/hf"
+OFFLOAD_DIR = os.getenv("OFFLOAD_DIR", "/data/offload")
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(OFFLOAD_DIR, exist_ok=True)
+
 HF_TOKEN = (
     os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     or os.getenv("HUGGINGFACE_HUB_TOKEN") or None
