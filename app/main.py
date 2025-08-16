@@ -125,7 +125,7 @@ def debug_ha_status():
         "rag_rows_loaded": rag_rows,
         # MAUDE local enrichment
         "maude_local_only": os.getenv("MAUDE_LOCAL_ONLY", "1") == "1",
-        "maude_local_path": os.getenv("MAUDE_LOCAL_JSONL", "app/rag_sources/sigma_spectrum_maude.jsonl"),
+        "maude_local_path": os.getenv("MAUDE_LOCAL_JSONL", "app/rag_sources/maude_sigma_spectrum.jsonl"),
         "maude_fraction": float(os.getenv("MAUDE_FRACTION", "0.70")),
         "maude_local_rows": maude_local_rows,
         # effective caches/offload (what the model really uses)
