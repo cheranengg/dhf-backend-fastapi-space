@@ -108,23 +108,24 @@ def health():
         "quick_limit": QUICK_LIMIT,
     }
 
-
 @app.get("/debug/ha_status")
 def debug_ha_status():
-    """Adapter-only status + RAG + MAUDE visibility for HA service."""
+    """Adapter-only status + RAG + MAUDE visibility."""
     rag_rows = len(getattr(ha_infer, "_RAG_DB", []) or [])
+    maude_local_rows = len(getattr(ha_infer, "_MAUDE_ROWS", []) or [])
     return {
         "adapter_enabled": bool(os.getenv("USE_HA_ADAPTER", "1") == "1"),
         "adapter_repo": os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter"),
         "base_model": os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
         "rag_path": os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl"),
         "rag_rows_loaded": rag_rows,
-        # MAUDE internet enrichment
-        "maude_fetch": os.getenv("MAUDE_FETCH", "0") == "1",
-        "maude_device": os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM"),
-        "maude_limit": int(os.getenv("MAUDE_LIMIT", "20")),
-        "maude_ttl": int(os.getenv("MAUDE_TTL", "86400")),
-        "quick_limit": QUICK_LIMIT,
+        # MAUDE local enrichment
+        "maude_local_only": os.getenv("MAUDE_LOCAL_ONLY", "1") == "1",
+        "maude_local_path": os.getenv("MAUDE_LOCAL_JSONL", "app/rag_sources/sigma_spectrum_maude.jsonl"),
+        "maude_fraction": float(os.getenv("MAUDE_FRACTION", "0.70")),
+        "maude_local_rows": maude_local_rows,
+        "ha_row_limit": int(os.getenv("HA_ROW_LIMIT", "5")),
+        "ha_max_new_tokens": int(os.getenv("HA_MAX_NEW_TOKENS", "192")),
     }
 
 
