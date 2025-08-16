@@ -3,7 +3,6 @@ transformers==4.44.2
 accelerate==0.33.0
 peft==0.12.0
 bitsandbytes==0.43.1
-
 safetensors>=0.4.3
 sentencepiece>=0.1.99
 huggingface_hub>=0.23,<0.25
@@ -12,6 +11,6 @@ uvicorn[standard]>=0.29,<0.32
 protobuf==4.25.3
 numpy
 requests
-# optional only if truly used at runtime
+# optional:
 # sentence-transformers>=2.5,<3.0
 # faiss-cpu>=1.7.4
