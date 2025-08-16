@@ -477,9 +477,10 @@ def _gen_test_block(req: str) -> Dict[str, str]:
 
     decoded = _tokenizer.decode(out[0], skip_special_tokens=True)
 
-    # Extract trailing JSON block
+    # --- Robust JSON extraction & repair ---
     def _balanced_json(text: str) -> Optional[str]:
         depth, start = 0, -1
+        last_good = None
         for i, ch in enumerate(text):
             if ch == "{":
                 if depth == 0:
@@ -489,14 +490,51 @@ def _gen_test_block(req: str) -> Dict[str, str]:
                 if depth > 0:
                     depth -= 1
                     if depth == 0 and start >= 0:
-                        return text[start:i + 1]
-        return None
+                        last_good = text[start:i+1]  # keep most recent balanced object
+        return last_good
+
+    def _repair_json_text(js: str) -> str:
+        if not js:
+            return js
+        # normalize weird quotes
+        js = js.replace("“", "\"").replace("”", "\"").replace("’", "'")
+        # collapse newlines/extra spaces inside known keys
+        key_patterns = [
+            r'"Verification\s+Method"',
+            r'"Sample\s+Size"',
+            r'"Test\s+Procedure"',
+            r'"Acceptance\s+Criteria"',
+        ]
+        replacements = [
+            '"Verification Method"',
+            '"Sample Size"',
+            '"Test Procedure"',
+            '"Acceptance Criteria"',
+        ]
+        for pat, rep in zip(key_patterns, replacements):
+            js = re.sub(pat, rep, js, flags=re.IGNORECASE)
+
+        # Remove trailing commas before } or ]
+        js = re.sub(r",(\s*[}\]])", r"\1", js)
+
+        # Some models add backticks or code fences
+        js = js.strip().strip("`").strip()
+
+        return js
 
     js = _balanced_json(decoded)
-    try:
-        obj = json.loads(js) if js else {}
-    except Exception:
-        obj = {}
+    obj: Dict[str, Any] = {}
+    if js:
+        fixed = _repair_json_text(js)
+        try:
+            obj = json.loads(fixed)
+        except Exception:
+            # last resort: try to salvage by removing line breaks between quotes/colons
+            fixed2 = re.sub(r'"\s*:\s*"', '": "', fixed)
+            try:
+                obj = json.loads(fixed2)
+            except Exception:
+                obj = {}
 
     bullets = _clean_bullets(obj.get("Test Procedure", ""))
     if bullets == "TBD":
