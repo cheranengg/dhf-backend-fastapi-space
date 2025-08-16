@@ -1,22 +1,32 @@
-# app/routers/ha.py  (where your /hazard-analysis endpoint lives)
+# app/routers/ha.py
+from __future__ import annotations
+
 from fastapi import APIRouter, Request
-from app.models.ha_infer import ha_predict, _RAG_DB, USE_HA_ADAPTER, USE_HA_MODEL
+from typing import Dict, Any, List
+
+from app.models.ha_infer import (
+    infer_ha,             # <-- public API in current ha_infer.py
+    _RAG_DB,              # for quick diag counts
+    USE_HA_ADAPTER,
+)
 
 router = APIRouter()
 
 @router.post("/hazard-analysis")
-async def hazard_analysis(request: Request, body: dict):
-    reqs = body.get("requirements", [])
-    rows = ha_predict(reqs)
+async def hazard_analysis(request: Request, body: Dict[str, Any]):
+    """
+    Expects: {"requirements": [{"Requirement ID": "...", "Requirements": "..."}]}
+    Returns: {"ha": [...] } (+ optional {"diag": ...} if debug=1)
+    """
+    reqs: List[Dict[str, Any]] = body.get("requirements", []) or []
+    rows = infer_ha(reqs)
 
-    # if debug=1 in query string, attach quick diag
     debug = request.query_params.get("debug", "0") == "1"
-    resp = {"ha": rows}
+    resp: Dict[str, Any] = {"ha": rows}
     if debug:
         resp["diag"] = {
             "rag_rows": len(_RAG_DB),
             "adapter": USE_HA_ADAPTER,
-            "merged": USE_HA_MODEL,
-            "n_rows": len(rows)
+            "n_rows": len(rows),
         }
     return resp
