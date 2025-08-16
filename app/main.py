@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import traceback
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,15 +14,20 @@ try:
 except Exception:
     pass
 
-# Feature flags
-ENABLE_DVP = os.getenv("ENABLE_DVP", "1") == "1"
-ENABLE_TM  = os.getenv("ENABLE_TM",  "0") == "1"  # start disabled until ready
-MAX_REQS   = int(os.getenv("MAX_REQS", "10"))
+# -------------------------------------------------------------------
+# Feature flags & limits
+# -------------------------------------------------------------------
+ENABLE_DVP   = os.getenv("ENABLE_DVP", "1") == "1"
+ENABLE_TM    = os.getenv("ENABLE_TM",  "0") == "1"   # start disabled until ready
+MAX_REQS     = int(os.getenv("MAX_REQS", "10"))
+QUICK_LIMIT  = int(os.getenv("QUICK_LIMIT", "0"))    # 0 = off; >0 caps rows for quick tests
+BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "devtoken")
 
-# Import model modules
-from app.models import ha_infer  # HA adapter-only infer_ha()
+# -------------------------------------------------------------------
+# Model modules (import DVP/TM defensively)
+# -------------------------------------------------------------------
+from app.models import ha_infer  # uses infer_ha()
 
-# DVP/TM are optional; import defensively
 _dvp_available = False
 try:
     from app.models import dvp_infer  # type: ignore
@@ -38,22 +43,22 @@ except Exception:
     _tm_available = False
 
 # -------------------------------------------------------------------
-# Auth / App setup
+# FastAPI setup
 # -------------------------------------------------------------------
-BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "devtoken")
-
 app = FastAPI(title="DHF Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # lock down for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-def _auth(authorization: str | None):
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def _auth(authorization: Optional[str]) -> None:
     """Simple bearer-token auth shared by all endpoints."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing token")
@@ -62,17 +67,35 @@ def _auth(authorization: str | None):
         raise HTTPException(status_code=403, detail="Bad token")
 
 
-def _limit_requirements(reqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Cap volume to keep inference stable/responsive."""
+def _limit_requirements(
+    reqs: List[Dict[str, Any]],
+    n: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """
+    Cap the number of requirement rows we *process* to speed up test runs.
+    Precedence: per-call n > QUICK_LIMIT > MAX_REQS.
+    """
     if not isinstance(reqs, list):
         return []
-    if MAX_REQS and len(reqs) > MAX_REQS:
-        return reqs[:MAX_REQS]
+    hard = n or QUICK_LIMIT or MAX_REQS
+    if hard and len(reqs) > hard:
+        return reqs[:hard]
     return reqs
 
 
+def _cap_rows(rows: List[Dict[str, Any]], n: Optional[int]) -> List[Dict[str, Any]]:
+    """Cap the number of rows we *return* for quick previews."""
+    if not isinstance(rows, list):
+        return []
+    if n and len(rows) > n:
+        return rows[:n]
+    if QUICK_LIMIT and len(rows) > QUICK_LIMIT:
+        return rows[:QUICK_LIMIT]
+    return rows
+
+
 # -------------------------------------------------------------------
-# Health / Debug
+# Endpoints
 # -------------------------------------------------------------------
 @app.get("/health")
 def health():
@@ -82,12 +105,13 @@ def health():
         "enable_tm": ENABLE_TM and _tm_available,
         "tm_available": _tm_available,
         "max_reqs": MAX_REQS,
+        "quick_limit": QUICK_LIMIT,
     }
 
 
 @app.get("/debug/ha_status")
 def debug_ha_status():
-    """Adapter-only HA status + RAG + MAUDE visibility."""
+    """Adapter-only status + RAG + MAUDE visibility for HA service."""
     rag_rows = len(getattr(ha_infer, "_RAG_DB", []) or [])
     return {
         "adapter_enabled": bool(os.getenv("USE_HA_ADAPTER", "1") == "1"),
@@ -100,39 +124,17 @@ def debug_ha_status():
         "maude_device": os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM"),
         "maude_limit": int(os.getenv("MAUDE_LIMIT", "20")),
         "maude_ttl": int(os.getenv("MAUDE_TTL", "86400")),
+        "quick_limit": QUICK_LIMIT,
     }
 
 
-@app.get("/debug/dvp_status")
-def debug_dvp_status():
-    """DVP adapter + retrieval/Serper flags for quick inspection."""
-    return {
-        "dvp_available": _dvp_available,
-        "adapter_enabled": os.getenv("USE_DVP_ADAPTER", "1") == "1",
-        "adapter_repo": os.getenv("DVP_ADAPTER_REPO", "cheranengg/dhf-dvp-adapter"),
-        "base_model": os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
-        "retrieval_enabled": os.getenv("ENABLE_DVP_RETRIEVAL", "1") == "1",
-        "serper_key_present": bool(os.getenv("SERPER_API_KEY", "")),
-        "gen": {
-            "max_new_tokens": int(os.getenv("DVP_MAX_NEW_TOKENS", "320")),
-            "temperature": float(os.getenv("DVP_TEMPERATURE", "0.3")),
-            "top_p": float(os.getenv("DVP_TOP_P", "0.9")),
-            "do_sample": os.getenv("DVP_DO_SAMPLE", "1") == "1",
-            "num_beams": int(os.getenv("DVP_NUM_BEAMS", "1")),
-            "repetition_penalty": float(os.getenv("DVP_REPETITION_PENALTY", "1.05")),
-        },
-    }
-
-
-# -------------------------------------------------------------------
-# Endpoints
-# -------------------------------------------------------------------
 @app.post("/hazard-analysis")
 def hazard_endpoint(
     request: Request,
     payload: Dict[str, Any] = Body(...),
-    authorization: str | None = Header(default=None),
-    debug: int = Query(0),
+    authorization: Optional[str] = Header(default=None),
+    debug: int = Query(0, description="Include diagnostics in response"),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
 ):
     """
     Request body:
@@ -144,13 +146,15 @@ def hazard_endpoint(
     }
     """
     _auth(authorization)
+
     diag: Dict[str, Any] = {}
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
-        reqs = _limit_requirements(reqs)
+        reqs = _limit_requirements(reqs, n=limit)
 
         # === HA inference (adapter + synthetic RAG + MAUDE enrichment) ===
         ha_rows = ha_infer.infer_ha(reqs)
+        ha_rows = _cap_rows(ha_rows, limit)
 
         if debug:
             diag = {
@@ -164,27 +168,19 @@ def hazard_endpoint(
                 "maude_limit": int(os.getenv("MAUDE_LIMIT", "20")),
                 "maude_ttl": int(os.getenv("MAUDE_TTL", "86400")),
                 "n_rows": len(ha_rows),
+                "quick_limit": QUICK_LIMIT,
+                "limit_param": limit,
             }
 
         return {"ok": True, "ha": ha_rows, **({"diag": diag} if debug else {})}
 
     except Exception as e:
         tb = traceback.format_exc()
-        # log full details to the Space logs
         print({"hazard_endpoint_error": str(e), "traceback": tb})
         if debug:
             diag.update({
                 "error": str(e),
                 "traceback": tb,
-                "adapter": os.getenv("USE_HA_ADAPTER", "1") == "1",
-                "adapter_repo": os.getenv("HA_ADAPTER_REPO", "cheranengg/dhf-ha-adapter"),
-                "base_model": os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2"),
-                "rag_path": os.getenv("HA_RAG_PATH", "app/rag_sources/ha_synthetic.jsonl"),
-                "rag_rows": len(getattr(ha_infer, "_RAG_DB", []) or []),
-                "maude_fetch": os.getenv("MAUDE_FETCH", "0") == "1",
-                "maude_device": os.getenv("MAUDE_DEVICE", "SIGMA SPECTRUM"),
-                "maude_limit": int(os.getenv("MAUDE_LIMIT", "20")),
-                "maude_ttl": int(os.getenv("MAUDE_TTL", "86400")),
             })
             return {"ok": False, "ha": [], "diag": diag}
         raise HTTPException(status_code=500, detail=f"HA failed: {e}")
@@ -193,13 +189,14 @@ def hazard_endpoint(
 @app.post("/dvp")
 def dvp_endpoint(
     payload: Dict[str, Any] = Body(...),
-    authorization: str | None = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
 ):
     """
     Request body:
     {
-      "requirements": [...],
-      "ha": [...]      # optional but helpful
+      "requirements": [...],   # shape like hazard-analysis
+      "ha": [...]              # output from hazard-analysis (optional but helpful)
     }
     """
     _auth(authorization)
@@ -208,17 +205,21 @@ def dvp_endpoint(
     try:
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
         ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
-        reqs = _limit_requirements(reqs)
+
+        reqs    = _limit_requirements(reqs, n=limit)
+        ha_rows = _cap_rows(ha_rows, limit)
+
         dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)  # type: ignore
+        dvp_rows = _cap_rows(dvp_rows, limit)
         return {"ok": True, "dvp": dvp_rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DVP failed: {e}")
 
 
-# ---------------- TM handlers (two routes mapping to same function) -------------
 def _tm_handler(
     payload: Dict[str, Any],
-    authorization: str | None,
+    authorization: Optional[str],
+    limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Accepts:
@@ -236,13 +237,24 @@ def _tm_handler(
         reqs: List[Dict[str, Any]] = payload.get("requirements") or []
         ha_rows: List[Dict[str, Any]] = payload.get("ha") or []
         dvp_rows: List[Dict[str, Any]] = payload.get("dvp") or []
-        reqs = _limit_requirements(reqs)
+
+        reqs     = _limit_requirements(reqs, n=limit)
+        ha_rows  = _cap_rows(ha_rows, limit)
+        dvp_rows = _cap_rows(dvp_rows, limit)
 
         if hasattr(tm_infer, "tm_predict"):
             tm_rows = tm_infer.tm_predict(reqs, ha_rows, dvp_rows)  # type: ignore
         else:
-            # lightweight fallback row (no model): prevents 404s in UI
+            # very light fallback (no model): join key fields so UI doesn’t 404
             from collections import defaultdict
+
+            def j(values):
+                vals = [str(v).strip() for v in values if str(v).strip() and str(v).strip().upper() != "NA"]
+                seen = []
+                for v in vals:
+                    if v not in seen:
+                        seen.append(v)
+                return ", ".join(seen) if seen else "TBD - Human / SME input"
 
             ha_by_req = defaultdict(list)
             for h in ha_rows:
@@ -255,14 +267,6 @@ def _tm_handler(
                 vid = str(d.get("verification_id") or d.get("Verification ID") or "")
                 if vid and vid not in dvp_by_vid:
                     dvp_by_vid[vid] = d
-
-            def j(values):
-                vals = [str(v).strip() for v in values if str(v).strip() and str(v).strip().upper() != "NA"]
-                seen = []
-                for v in vals:
-                    if v not in seen:
-                        seen.append(v)
-                return ", ".join(seen) if seen else "TBD - Human / SME input"
 
             tm_rows: List[Dict[str, Any]] = []
             for r in reqs:
@@ -291,6 +295,7 @@ def _tm_handler(
                     "acceptance_criteria": crit,
                 })
 
+        tm_rows = _cap_rows(tm_rows, limit)
         return {"ok": True, "tm": tm_rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TM failed: {e}")
@@ -299,23 +304,26 @@ def _tm_handler(
 @app.post("/tm")
 def tm_endpoint(
     payload: Dict[str, Any] = Body(...),
-    authorization: str | None = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
 ):
-    return _tm_handler(payload, authorization)
+    return _tm_handler(payload, authorization, limit)
 
 
 @app.post("/trace-matrix")
 def trace_matrix_endpoint(
     payload: Dict[str, Any] = Body(...),
-    authorization: str | None = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
 ):
-    return _tm_handler(payload, authorization)
+    return _tm_handler(payload, authorization, limit)
 
 
 # ------------------------- Debug -----------------------------------
 @app.post("/debug/smoke")
 def debug_smoke(
-    authorization: str | None = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    limit: Optional[int] = Query(default=None, description="Cap rows for quick tests"),
 ):
     """
     Quick smoke test that runs HA (always) and DVP/TM if enabled.
@@ -323,21 +331,35 @@ def debug_smoke(
     _auth(authorization)
     reqs = [
         {"Requirement ID": "REQ-001", "Verification ID": "VER-001",
-         "Requirements": "The pump shall maintain flow accuracy within +/- 5% from set value."},
+         "Requirements": "The pump shall maintain flow accuracy within ±5% from set value."},
         {"Requirement ID": "REQ-002", "Verification ID": "VER-002",
          "Requirements": "Labeling shall be legible at 30 cm and use ISO 15223-1 symbols."},
+        {"Requirement ID": "REQ-003", "Verification ID": "VER-003",
+         "Requirements": "Occlusion alarm shall trigger within 30 seconds at 100 kPa back pressure."},
+        {"Requirement ID": "REQ-004", "Verification ID": "VER-004",
+         "Requirements": "Leakage current at rated voltage shall not exceed 100 µA."},
+        {"Requirement ID": "REQ-005", "Verification ID": "VER-005",
+         "Requirements": "User interface shall prevent decimal-point mis-entry during setup."},
+        {"Requirement ID": "REQ-006", "Verification ID": "VER-006",
+         "Requirements": "Materials in patient-contact shall pass ISO 10993-1 cytotoxicity test."},
     ]
+    reqs = _limit_requirements(reqs, n=limit)
+
     try:
-        ha_rows = ha_infer.infer_ha(_limit_requirements(reqs))
+        ha_rows = ha_infer.infer_ha(reqs)
+        ha_rows = _cap_rows(ha_rows, limit)
         out: Dict[str, Any] = {"ok": True, "ha": ha_rows}
 
         if ENABLE_DVP and _dvp_available:
-            dvp_rows = dvp_infer.dvp_predict(_limit_requirements(reqs), ha_rows)  # type: ignore
-            out["dvp"] = dvp_rows
+            dvp_rows = dvp_infer.dvp_predict(reqs, ha_rows)  # type: ignore
+            out["dvp"] = _cap_rows(dvp_rows, limit)
 
         if ENABLE_TM and _tm_available:
-            out["tm"] = _tm_handler({"requirements": reqs, "ha": ha_rows, "dvp": out.get("dvp", [])}, authorization)["tm"]  # type: ignore
-
+            out["tm"] = _cap_rows(
+                _tm_handler({"requirements": reqs, "ha": ha_rows, "dvp": out.get("dvp", [])},
+                            authorization, limit)["tm"],  # type: ignore
+                limit
+            )
         return out
     except Exception as e:
         return {"ok": False, "error": str(e)}
