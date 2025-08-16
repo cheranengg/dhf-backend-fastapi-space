@@ -11,6 +11,5 @@ uvicorn[standard]>=0.29,<0.32
 protobuf==4.25.3
 numpy<2.0
 requests
-# optional:
-# sentence-transformers>=2.5,<3.0
-# faiss-cpu>=1.7.4
+sentence-transformers==2.7.0
+faiss-cpu==1.7.4
