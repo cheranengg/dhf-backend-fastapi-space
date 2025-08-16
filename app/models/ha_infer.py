@@ -1,4 +1,3 @@
-# app/models/ha_infer.py
 from __future__ import annotations
 
 import os
@@ -49,7 +48,7 @@ PARAPHRASE_MAX_WORDS: int = int(os.getenv("PARAPHRASE_MAX_WORDS", "22"))
 ROW_LIMIT: int = int(os.getenv("HA_ROW_LIMIT", "50"))
 
 # Debug logging controls
-DEBUG_HA: bool = os.getenv("DEBUG_HA", "1") == "1"  # prints device/quant + short output peek
+DEBUG_HA: bool = os.getenv("DEBUG_HA", "1") == "1"
 DEBUG_PEEK_CHARS: int = int(os.getenv("DEBUG_PEEK_CHARS", "320"))
 
 # ---------------------------
@@ -57,10 +56,9 @@ DEBUG_PEEK_CHARS: int = int(os.getenv("DEBUG_PEEK_CHARS", "320"))
 # ---------------------------
 _tokenizer = None
 _model = None
-_RAG_DB: List[Dict[str, Any]] = []      # generic RAG rows
-_MAUDE_ROWS: List[Dict[str, Any]] = []  # parsed local MAUDE jsonl (fast)
+_RAG_DB: List[Dict[str, Any]] = []
+_MAUDE_ROWS: List[Dict[str, Any]] = []
 _logged_model_banner = False
-
 
 # ---------------------------
 # Utilities
@@ -82,24 +80,18 @@ def _jsonl_load(path: str) -> List[Dict[str, Any]]:
             print(f"[ha] _jsonl_load failed for {path}: {e}")
     return rows
 
-
 def _maybe_truncate_words(s: str, max_words: int) -> str:
     toks = re.split(r"\s+", s.strip())
     if len(toks) <= max_words:
         return s.strip()
     return " ".join(toks[:max_words]).strip()
 
-
 def _paraphrase_sentence(s: str) -> str:
     out = s.strip()
-    out = out.replace("shall", "must")
-    out = out.replace("patient", "the patient")
-    out = out.replace("device", "system")
-    out = out.replace("ensure", "make sure")
-    out = out.replace("maintain", "keep")
+    out = out.replace("shall", "must").replace("patient", "the patient").replace("device", "system")
+    out = out.replace("ensure", "make sure").replace("maintain", "keep")
     out = _maybe_truncate_words(out, PARAPHRASE_MAX_WORDS)
     return out
-
 
 def _gc_cuda():
     try:
@@ -110,68 +102,44 @@ def _gc_cuda():
     except Exception:
         pass
 
-
 def _log_once_banner(extra: str = ""):
     global _logged_model_banner
-    if _logged_model_banner or not DEBUG_HA:
-        return
+    if _logged_model_banner or not DEBUG_HA: return
     _logged_model_banner = True
-    print(
-        "[ha] init: "
-        f"BASE_MODEL_ID={BASE_MODEL_ID} | ADAPTER={HA_ADAPTER_REPO if USE_HA_ADAPTER else 'disabled'} | "
-        f"CACHE_DIR={CACHE_DIR} | OFFLOAD_DIR={OFFLOAD_DIR} | "
-        f"RAG_PATH={HA_RAG_PATH} | MAUDE_LOCAL_PATH={MAUDE_LOCAL_PATH} | " + extra
-    )
-
+    print("[ha] init: "
+          f"BASE_MODEL_ID={BASE_MODEL_ID} | ADAPTER={HA_ADAPTER_REPO if USE_HA_ADAPTER else 'disabled'} | "
+          f"CACHE_DIR={CACHE_DIR} | OFFLOAD_DIR={OFFLOAD_DIR} | "
+          f"RAG_PATH={HA_RAG_PATH} | MAUDE_LOCAL_PATH={MAUDE_LOCAL_PATH} | " + extra)
 
 # ---------------------------
-# Model loader (explicit 4-bit if available)
+# Model loader
 # ---------------------------
 def _load_model():
     global _tokenizer, _model
-
     if _model is not None and _tokenizer is not None:
         return
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
-
     device_map = "auto" if (torch.cuda.is_available() and not FORCE_CPU) else None
     want_cuda = (device_map == "auto")
-    bnb_ok = False
-    bnb_cfg = None
-    dtype = torch.float16
-    if want_cuda:
-        # L4 is Ampere; bfloat16 compute is usually great for bnb 4-bit
-        dtype = torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
-    else:
-        dtype = torch.float32
-
+    bnb_ok, bnb_cfg = False, None
+    dtype = torch.bfloat16 if (want_cuda and hasattr(torch, "bfloat16")) else (torch.float16 if want_cuda else torch.float32)
     try:
         from transformers import BitsAndBytesConfig
         bnb_ok = True
-        bnb_cfg = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=dtype,
-        )
+        bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                     bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=dtype)
     except Exception:
         bnb_ok = False
 
-    # tokenizer
     _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, cache_dir=CACHE_DIR)
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token
 
-    load_kwargs = dict(
-        cache_dir=CACHE_DIR,
-        low_cpu_mem_usage=True,
-    )
+    load_kwargs = dict(cache_dir=CACHE_DIR, low_cpu_mem_usage=True)
     if want_cuda:
         load_kwargs.update(dict(device_map="auto", torch_dtype=dtype, offload_folder=OFFLOAD_DIR))
-
     try:
-        # Prefer 4-bit if bnb is present; otherwise try fp16/bf16; fallback to CPU fp32 last
         if bnb_ok and want_cuda:
             load_kwargs.update(dict(quantization_config=bnb_cfg))
             print("[ha] loading base in 4-bit...")
@@ -193,7 +161,6 @@ def _load_model():
             _model.config.pad_token_id = _tokenizer.pad_token_id
         except Exception:
             pass
-
         if device_map is None:
             _model.to("cuda" if want_cuda else "cpu")
 
@@ -203,12 +170,12 @@ def _load_model():
             print(f"[ha] model loaded. device={eff_device} bnb={bnb_ok} dtype={dtype}")
 
     except Exception as e:
-        # Final fallback: CPU fp32
         _gc_cuda()
         print(f"[ha] WARNING: GPU/4-bit load failed → falling back to CPU fp32. err={e}")
         _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, cache_dir=CACHE_DIR)
         if _tokenizer.pad_token is None:
             _tokenizer.pad_token = _tokenizer.eos_token
+        from transformers import AutoModelForCausalLM
         _model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, cache_dir=CACHE_DIR)
         try:
             _model.config.pad_token_id = _tokenizer.pad_token_id
@@ -218,83 +185,60 @@ def _load_model():
             _log_once_banner(extra="device=cpu (fallback)")
             print("[ha] model loaded on CPU (fallback).")
 
-
 # ---------------------------
-# RAG + MAUDE loaders
+# RAG + MAUDE
 # ---------------------------
 def _load_rag_once():
-    """Load a generic RAG jsonl once. Accepts multiple possible field names."""
     global _RAG_DB
-    if _RAG_DB:
-        return
+    if _RAG_DB: return
     _RAG_DB = _jsonl_load(HA_RAG_PATH)
     if DEBUG_HA:
         print(f"[ha] RAG loaded: {len(_RAG_DB)} rows from {HA_RAG_PATH}")
 
-
 def _load_maude_once():
-    """Load local MAUDE jsonl once (fast)."""
     global _MAUDE_ROWS
-    if _MAUDE_ROWS:
-        return
+    if _MAUDE_ROWS: return
     _MAUDE_ROWS = _jsonl_load(MAUDE_LOCAL_PATH)
     if DEBUG_HA:
         print(f"[ha] MAUDE loaded: {len(_MAUDE_ROWS)} rows from {MAUDE_LOCAL_PATH}")
 
-
 def _pick_rag_seed() -> Optional[str]:
-    """Pull a short seed text from the RAG DB using tolerant fields."""
-    if not _RAG_DB:
-        return None
-    candidate_fields = [
-        "Hazard", "hazard",
-        "risk_to_health", "Risk to Health",
-        "hazardous_situation", "Hazardous Situation",
-        "harm", "Harm",
-        "text", "event_text", "event_description", "device_problem_text",
-    ]
+    if not _RAG_DB: return None
+    fields = ["Hazard","hazard","risk_to_health","Risk to Health","hazardous_situation","Hazardous Situation",
+              "harm","Harm","text","event_text","event_description","device_problem_text"]
     for _ in range(12):
         row = random.choice(_RAG_DB)
-        for k in candidate_fields:
+        for k in fields:
             v = row.get(k)
             if isinstance(v, str) and len(v.strip()) > 8:
                 return _maybe_truncate_words(v.strip(), PARAPHRASE_MAX_WORDS + 6)
     return None
 
-
 def _maude_snippets(k: int = 6) -> List[str]:
-    """Pick k short narratives from local MAUDE rows."""
     _load_maude_once()
-    if not _MAUDE_ROWS:
-        return []
-
+    if not _MAUDE_ROWS: return []
     texts: List[str] = []
     for r in _MAUDE_ROWS:
-        for key in ("event_description", "device_problem_text", "event_text", "text", "event"):
+        for key in ("event_description","device_problem_text","event_text","text","event"):
             val = r.get(key)
             if isinstance(val, str) and len(val.strip()) > 20:
                 texts.append(val.strip())
-
         mdr = r.get("mdr_text", [])
         if isinstance(mdr, list):
             for t in mdr:
                 txt = t.get("text") if isinstance(t, dict) else None
                 if isinstance(txt, str) and len(txt.strip()) > 20:
                     texts.append(txt.strip())
-
-    if not texts:
-        return []
+    if not texts: return []
     random.shuffle(texts)
     keep: List[str] = []
     for t in texts[: 4 * k]:
         keep.append(_maybe_truncate_words(t, 40))
-        if len(keep) >= k:
-            break
+        if len(keep) >= k: break
     return keep
 
-
 # ---------------------------
-# Prompt + generation
+# Prompt
 # ---------------------------
 _SCHEMA = """
 Return a compact JSON object with keys:
@@ -320,7 +264,7 @@ def _build_prompt(req_text: str, rag_seed: Optional[str], maude_bits: List[str])
     if maude_bits:
         context += "\nMAUDE snippets:\n- " + "\n- ".join(maude_bits)
 
-    prompt = f"""You are a safety engineer performing Hazard Analysis for an infusion pump.
+    return f"""You are a safety engineer performing Hazard Analysis for an infusion pump.
 
 Requirement: {req_text}
 
@@ -332,36 +276,24 @@ If some items truly cannot be inferred, pick reasonable, generic infusion-pump p
 {context}
 
 Now output ONLY the JSON:"""
-    return prompt
-
 
 # --- robust JSON extraction (prefer LAST balanced block) ---
 def _balanced_json_last(text: str) -> Optional[str]:
-    """
-    Return the last balanced {...} block from the text.
-    Avoids accidentally selecting JSON-like braces from the prompt/schema.
-    """
-    depth, start = 0, -1
-    last = None
+    depth, start, last = 0, -1, None
     for i, ch in enumerate(text):
         if ch == "{":
-            if depth == 0:
-                start = i
+            if depth == 0: start = i
             depth += 1
         elif ch == "}":
             if depth > 0:
                 depth -= 1
                 if depth == 0 and start >= 0:
-                    last = text[start:i + 1]
+                    last = text[start:i+1]
     return last
 
-
 def _decode_json_from_text(txt: str) -> Dict[str, Any]:
-    """Robust JSON extraction picking the *last* balanced object."""
     blob = _balanced_json_last(txt)
-    if not blob:
-        return {}
-    # Fix a few common trailing commas
+    if not blob: return {}
     blob = re.sub(r",\s*}", "}", blob)
     blob = re.sub(r",\s*\]", "]", blob)
     try:
@@ -370,16 +302,12 @@ def _decode_json_from_text(txt: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
 def _generate_json(prompt: str) -> Dict[str, Any]:
     _load_model()
     device = _model.device  # type: ignore
-
-    # Tokenize with an input cap to avoid OOM
     enc = _tokenizer(prompt, return_tensors="pt", truncation=True,
                      max_length=HA_INPUT_MAX_TOKENS, padding=True)  # type: ignore
     inputs = {k: v.to(device) for k, v in enc.items()}
-
     with torch.no_grad():
         out = _model.generate(  # type: ignore
             **inputs,
@@ -391,15 +319,105 @@ def _generate_json(prompt: str) -> Dict[str, Any]:
             repetition_penalty=REPETITION_PENALTY,
             use_cache=True,
         )
-
     txt = _tokenizer.decode(out[0], skip_special_tokens=True)  # type: ignore
     if DEBUG_HA:
         peek = txt[:DEBUG_PEEK_CHARS].replace("\n", " ")
         print(f"[ha] output peek: {peek} ...")
+    return _decode_json_from_text(txt)
 
-    data = _decode_json_from_text(txt)
-    return data
+# ---------------------------
+# Deterministic, requirement-aware fallback
+# ---------------------------
+def _fallback_from_requirement(req: str) -> Dict[str, Any]:
+    t = (req or "").lower()
 
+    def pack(risk_to_health, hazard, hs, harm, seq, sev="3", p0="Medium", p1="Medium", poh="Low", idx="Medium", ctrl=None):
+        return {
+            "risk_to_health": risk_to_health,
+            "hazard": hazard,
+            "hazardous_situation": hs,
+            "harm": harm,
+            "sequence_of_events": seq,
+            "severity_of_harm": sev,
+            "p0": p0, "p1": p1, "poh": poh, "risk_index": idx,
+            "risk_control": ctrl or "Apply design controls, alarms, labeling, and verification per standards",
+        }
+
+    if any(k in t for k in ["air-in-line","air in line","bubble","embol"]):
+        return pack("Air Embolism","Air-in-line not detected","Patient receives air","Embolism",
+                    "Air bubble bypasses detector leading to infusion of air","4","Medium","Medium","Low","High",
+                    "Air-in-line detector with alarm; purge procedures")
+    if "occlusion" in t:
+        return pack("Under/Over-infusion","Line occlusion","Flow restricted during therapy","Therapy interruption",
+                    "Blockage increases pressure; pump stops improperly","3","Medium","Medium","Low","Medium",
+                    "Occlusion detection with alarms")
+    if any(k in t for k in ["flow","accuracy"]) and "%":
+        return pack("Over/Under-infusion","Inaccurate flow rate","Incorrect volume delivered","Dose error",
+                    "Calibration drift or mechanism wear causes deviation","3","Medium","Medium","Low","Medium",
+                    "Flow calibration; accuracy verification per IEC 60601-2-24")
+    if "alarm" in t:
+        return pack("Delayed response","Alarm not triggered","User not alerted to hazard","Patient harm due to delay",
+                    "Fault occurs; alarm logic fails to trigger","3","Medium","Medium","Low","Medium",
+                    "Alarm design per IEC 60601-1-8; response time verification")
+    if any(k in t for k in ["leakage current","leakage"]):
+        return pack("Electrical shock","Excess leakage current","User contacts accessible parts","Shock",
+                    "Insulation/filters degrade causing leakage rise","4","Low","Low","Low","Medium",
+                    "Leakage limits per IEC 60601-1; insulation & Y-cap values")
+    if any(k in t for k in ["dielectric","hi-pot","hipot"]):
+        return pack("Electrical breakdown","Insulation breakdown","Mains-to-secondary failure","Shock/burn",
+                    "High potential causes flashover","4","Low","Low","Low","Medium",
+                    "Dielectric test per IEC 60601-1")
+    if any(k in t for k in ["insulation resistance","insulation"]):
+        return pack("Leakage paths","Low insulation resistance","Creepage/clearance compromised","Shock",
+                    "Humidity/contamination reduces resistance","3","Low","Low","Low","Medium",
+                    "Creepage/clearance per IEC 60601-1; material selection")
+    if any(k in t for k in ["earth continuity","protective earth","ground"]):
+        return pack("Shock on fault","Protective earth open","Chassis not bonded","Shock",
+                    "PE conductor loose/broken under stress","4","Low","Low","Low","Medium",
+                    "Bonding test 25A/60s; star washer; rivets avoided")
+    if any(k in t for k in ["emissions","rf emission","radiated emission"]):
+        return pack("Interference to other devices","Excess RF emissions","Nearby devices affected","Misdiagnosis",
+                    "Poor shielding/clock harmonics radiate","2","Low","Low","Low","Low",
+                    "IEC 60601-1-2 emissions; shielding and filtering")
+    if any(k in t for k in ["immunity","esd","radiated immunity","burst","surge"]):
+        return pack("Functional disturbance","Insufficient EMC immunity","Device upset during ESD/RF","Therapy interruption",
+                    "Immunity event couples to sensitive circuits","3","Medium","Medium","Low","Medium",
+                    "IEC 60601-1-2 immunity; layout/TVS; watchdogs")
+    if any(k in t for k in ["temperature rise","overheat","thermal"]):
+        return pack("Burns/Failure","Over-temperature","Surface exceeds limits","Burns/Failure",
+                    "High load or blocked vents cause heating","3","Low","Low","Low","Medium",
+                    "Thermal design; derating; temp rise tests")
+    if any(k in t for k in ["drop","shock","vibration","impact"]):
+        return pack("Mechanical failure","Mechanical shock/vibration","Damage after handling/transport","Break/Leak",
+                    "Impact exceeds structural margins","3","Medium","Medium","Low","Medium",
+                    "Mechanical robustness tests (60068/60601-1)")
+    if any(k in t for k in ["ingress","ipx","ip2x"]):
+        return pack("Short/Corrosion","Ingress of water/objects","Exposure to environment","Failure",
+                    "Gaps allow water/objects in","3","Medium","Medium","Low","Medium",
+                    "IP ratings per IEC 60529; seals & drip shields")
+    if any(k in t for k in ["battery","62133"]):
+        return pack("Fire/Explosion","Battery failure","Abuse or defect","Fire/Explosion",
+                    "Overcharge/short causes thermal runaway","5","Low","Low","Low","High",
+                    "Cell selection; BMS; IEC 62133; protective circuits")
+    if any(k in t for k in ["label","udi","marking"]):
+        return pack("Use error","Mislabeling/unclear symbols","User misinterprets info","Use error",
+                    "Symbols/text not clear/complete","2","Low","Low","Low","Low",
+                    "Labeling per ISO 15223-1; UDI compliance")
+    if any(k in t for k in ["security","lock","unauthorized"]):
+        return pack("Misuse","Unauthorized changes","Therapy settings altered","Dose error",
+                    "Access control bypassed","3","Low","Low","Low","Medium",
+                    "Access control; audit; lockouts")
+    # generic
+    return {
+        "risk_to_health": "Adverse physiological effects",
+        "hazard": "Device malfunction",
+        "hazardous_situation": "Patient exposed to device fault",
+        "harm": "Therapy interruption or incorrect dose",
+        "sequence_of_events": "Design or use issue results in unsafe state",
+        "severity_of_harm": "3",
+        "p0": "Medium", "p1": "Medium", "poh": "Low", "risk_index": "Medium",
+        "risk_control": "Design controls, alarms, verification, and labeling per standards",
+    }
 
 # ---------------------------
 # Post processing / defaults
@@ -423,26 +441,19 @@ def _ensure_fields(d: Dict[str, Any]) -> Dict[str, Any]:
         "risk_index": s("risk_index", "Medium"),
         "risk_control": s("risk_control", "System operating manual provides clear purging and setup cautions/warnings"),
     }
-    # Normalize severity to "1".."5"
-    sev = out["severity_of_harm"]
-    if not re.fullmatch(r"[1-5]", sev):
+    if not re.fullmatch(r"[1-5]", out["severity_of_harm"]):
         out["severity_of_harm"] = "3"
     for k in ("p0", "p1", "poh"):
-        if out[k] not in {"Very Low", "Low", "Medium", "High", "Very High"}:
+        if out[k] not in {"Very Low","Low","Medium","High","Very High"}:
             out[k] = "Medium"
-    if out["risk_index"] not in {"Low", "Medium", "High", "Very High"}:
+    if out["risk_index"] not in {"Low","Medium","High","Very High"}:
         out["risk_index"] = "Medium"
     return out
-
 
 # ---------------------------
 # Public API
 # ---------------------------
 def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Input: [{"Requirement ID": "...", "Requirements": "..."} ...]
-    Output rows with keys used by the UI/export pipeline.
-    """
     _load_rag_once()
     _load_maude_once()
 
@@ -456,10 +467,7 @@ def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         rid = str(r.get("Requirement ID") or r.get("requirement_id") or "").strip() or "REQ-XXX"
         req_text = str(r.get("Requirements") or r.get("requirements") or "").strip()
 
-        # RAG seed (tolerant field search), then lightly paraphrase
         rag_seed = _pick_rag_seed()
-
-        # MAUDE snippets for a fraction of rows
         maude_bits: List[str] = []
         if MAUDE_LOCAL_ONLY and random.random() < MAUDE_FRACTION:
             maude_bits = _maude_snippets(k=4)
@@ -472,7 +480,21 @@ def infer_ha(requirements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 print(f"[ha] generation error: {e}")
             raw = {}
 
+        # If model didn't produce a usable JSON, compute a deterministic fallback from the requirement text
+        usable = isinstance(raw, dict) and len([k for k in raw.keys() if k in {
+            "risk_to_health","hazard","hazardous_situation","harm","sequence_of_events","severity_of_harm",
+            "p0","p1","poh","risk_index","risk_control"}]) >= 3
+        if not usable:
+            raw = {**_fallback_from_requirement(req_text), **(raw or {})}
+
         data = _ensure_fields(raw)
+
+        # deterministic, requirement-based risk_id
+        try:
+            num = abs(hash(rid)) % 9000 + 1000
+            data["risk_id"] = f"HA-{num}"
+        except Exception:
+            pass
 
         rows.append({
             "requirement_id": rid,
