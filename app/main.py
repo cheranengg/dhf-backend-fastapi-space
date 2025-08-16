@@ -19,7 +19,7 @@ except Exception:
 # -------------------------------------------------------------------
 ENABLE_DVP   = os.getenv("ENABLE_DVP", "1") == "1"
 ENABLE_TM    = os.getenv("ENABLE_TM",  "0") == "1"   # start disabled until ready
-MAX_REQS     = int(os.getenv("MAX_REQS", "10"))
+MAX_REQS     = int(os.getenv("MAX_REQS", "5"))
 QUICK_LIMIT  = int(os.getenv("QUICK_LIMIT", "0"))    # 0 = off; >0 caps rows for quick tests
 BACKEND_TOKEN = os.getenv("BACKEND_TOKEN", "devtoken")
 
@@ -108,6 +108,10 @@ def health():
         "quick_limit": QUICK_LIMIT,
     }
 
+@app.get("/")
+def root():
+    return {"ok": True, "service": "DHF Backend"}
+    
 @app.get("/debug/ha_status")
 def debug_ha_status():
     """Adapter-only status + RAG + MAUDE visibility."""
@@ -124,7 +128,12 @@ def debug_ha_status():
         "maude_local_path": os.getenv("MAUDE_LOCAL_JSONL", "app/rag_sources/sigma_spectrum_maude.jsonl"),
         "maude_fraction": float(os.getenv("MAUDE_FRACTION", "0.70")),
         "maude_local_rows": maude_local_rows,
+        # effective caches/offload (what the model really uses)
+        "hf_cache_dir": getattr(ha_infer, "CACHE_DIR", os.getenv("HF_HOME", "/tmp/hf")),
+        "offload_dir": getattr(ha_infer, "OFFLOAD_DIR", os.getenv("OFFLOAD_DIR", "/tmp/offload")),
+        # token/row caps
         "ha_row_limit": int(os.getenv("HA_ROW_LIMIT", "5")),
+        "ha_input_max_tokens": int(os.getenv("HA_INPUT_MAX_TOKENS", "512")),
         "ha_max_new_tokens": int(os.getenv("HA_MAX_NEW_TOKENS", "192")),
     }
 
