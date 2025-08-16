@@ -250,26 +250,20 @@ _logged    = False
 def _try_peft_loader():
     """Use project-specific PEFT loader if available; return (tok, model) or (None, None)."""
     try:
-        from app.models import _peft_loader as pl  # type: ignore
-        for name in ("load_peft_causal","load_peft","load_lora_model"):
-            fn = getattr(pl, name, None)
-            if fn:
-                if DEBUG_DVP: print(f"[dvp] using _peft_loader.{name}()")
-                obj = fn(
-                    base_model_id=BASE_MODEL_ID,
-                    adapter_repo=DVP_ADAPTER_REPO,
-                    cache_dir=CACHE_DIR,
-                    offload_dir=OFFLOAD_DIR,
-                    force_cpu=FORCE_CPU,
-                    return_tokenizer=True,
-                )
-                tok = obj.get("tokenizer")
-                mdl = obj.get("model")
-                return tok, mdl
+        from app.models._peft_loader import load_base_plus_adapter  # <-- your loader
+        tok, mdl, device = load_base_plus_adapter(
+            base_repo=BASE_MODEL_ID,
+            adapter_repo=DVP_ADAPTER_REPO,
+            load_4bit=True,                       # keep VRAM low on L4
+            force_cpu=FORCE_CPU,
+        )
+        if DEBUG_DVP:
+            print(f"[dvp] using _peft_loader.load_base_plus_adapter() on {device}; cache={CACHE_DIR}")
+        return tok, mdl
     except Exception as e:
         if DEBUG_DVP:
-            print(f"[dvp] _peft_loader not used: {e}")
-    return None, None
+            print(f"[dvp] _peft_loader load failed: {e}")
+        return None, None
 
 def _load_model():
     global _tokenizer, _model, _logged
