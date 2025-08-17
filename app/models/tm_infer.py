@@ -1,26 +1,13 @@
 from __future__ import annotations
-import os
+import os, re
 from typing import Any, Dict, List
 
-# ================================
-# Environment / feature toggles
-# ================================
 USE_TM_ADAPTER  = os.getenv("USE_TM_ADAPTER", "1") == "1"
 TM_ADAPTER_REPO = os.getenv("TM_ADAPTER_REPO", "cheranengg/dhf-tm-adapter")
 BASE_MODEL_ID   = os.getenv("BASE_MODEL_ID", "mistralai/Mistral-7B-Instruct-v0.2")
 
-HF_TOKEN = (
-    os.getenv("HF_TOKEN")
-    or os.getenv("HUGGING_FACE_HUB_TOKEN")
-    or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    or None
-)
-
-CACHE_DIR = (
-    os.getenv("HF_HOME")
-    or os.getenv("TRANSFORMERS_CACHE")
-    or "/tmp/hf"
-)
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+CACHE_DIR = os.getenv("HF_HOME") or os.getenv("TRANSFORMERS_CACHE") or "/tmp/hf"
 OFFLOAD_DIR = os.getenv("OFFLOAD_DIR", "/tmp/offload")
 FORCE_CPU   = os.getenv("FORCE_CPU", "0") == "1"
 DEBUG_TM    = os.getenv("DEBUG_TM", "1") == "1"
@@ -38,9 +25,6 @@ def _token_cache_kwargs() -> Dict[str, Any]:
         kw["token"] = HF_TOKEN
     return kw
 
-# ================================
-# (Optional) Model loader
-# ================================
 _tokenizer = None
 _model     = None
 _logged    = False
@@ -66,7 +50,6 @@ def _load_model():
     global _tokenizer, _model, _logged
     if _tokenizer is not None and _model is not None:
         return
-
     tok, mdl = _try_peft_loader()
     if tok is not None and mdl is not None:
         _tokenizer, _model = tok, mdl
@@ -75,63 +58,41 @@ def _load_model():
             print(f"[tm] model via _peft_loader on {dev}")
             _logged = True
         return
-
-    # fallback manual load (rarely used by TM)
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
     try:
-        from transformers import BitsAndBytesConfig  # type: ignore
-        dtype = (
-            torch.bfloat16 if (torch.cuda.is_available() and not FORCE_CPU and hasattr(torch, "bfloat16"))
-            else (torch.float16 if (torch.cuda.is_available() and not FORCE_CPU) else torch.float32)
-        )
-        bnb_cfg = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=dtype,
-        )
+        from transformers import BitsAndBytesConfig
+        dtype = torch.bfloat16 if (torch.cuda.is_available() and not FORCE_CPU and hasattr(torch, "bfloat16")) else (
+                torch.float16 if (torch.cuda.is_available() and not FORCE_CPU) else torch.float32)
+        bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                     bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=dtype)
     except Exception:
         bnb_cfg = None
-
     tok = AutoTokenizer.from_pretrained(BASE_MODEL_ID, **_token_cache_kwargs())
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-
     load_kwargs = dict(cache_dir=CACHE_DIR, low_cpu_mem_usage=True)
     if torch.cuda.is_available() and not FORCE_CPU:
-        load_kwargs.update(dict(
-            device_map="auto",
-            torch_dtype=torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16,
-            offload_folder=OFFLOAD_DIR,
-        ))
+        load_kwargs.update(dict(device_map="auto", torch_dtype=dtype, offload_folder=OFFLOAD_DIR))
     if bnb_cfg and not FORCE_CPU:
         load_kwargs.update(dict(quantization_config=bnb_cfg))
-
     base = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, **load_kwargs)
-
     if USE_TM_ADAPTER:
         from peft import PeftModel
         mdl = PeftModel.from_pretrained(base, TM_ADAPTER_REPO, **_token_cache_kwargs())
     else:
         mdl = base
-
     try:
-        mdl.config.pad_token_id = tok.pad_token_id  # type: ignore
+        mdl.config.pad_token_id = tok.pad_token_id
     except Exception:
         pass
-
     _tokenizer, _model = tok, mdl
     if DEBUG_TM and not _logged:
         dev = getattr(_model, "device", "cpu")
         print(f"[tm] model loaded (fallback) on {dev}; cache={CACHE_DIR} offload={OFFLOAD_DIR} adapter={USE_TM_ADAPTER}")
         _logged = True
 
-
-# ================================
-# Deterministic join helpers
-# ================================
-def _unique_join(values: List[str], default: str = "NA") -> str:
+def _unique_join(values: List[str], default: str = "TBD - Human / SME input") -> str:
     clean = []
     for v in values:
         s = (v or "").strip()
@@ -142,23 +103,25 @@ def _unique_join(values: List[str], default: str = "NA") -> str:
 def _is_header(text: str) -> bool:
     return (text or "").strip().lower().endswith("requirements")
 
+# relaxed token overlap (same as UI metric)
+def _tokenize(text: str) -> set[str]:
+    return set(re.findall(r"[a-zA-Z0-9]{4,}", (text or "").lower()))
 
-# ================================
-# Public API
-# ================================
+def _mapped(req: str, rc: str) -> bool:
+    rt = _tokenize(req); ct = _tokenize(rc)
+    if not rt or not ct: return False
+    if rt & ct: return True
+    for tkn in sorted(rt, key=len, reverse=True)[:5]:
+        if tkn in (rc or "").lower():
+            return True
+    return False
+
 def tm_predict(
     requirements: List[Dict[str, Any]],
     ha_rows: List[Dict[str, Any]],
     dvp_rows: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Returns rows with canonical, Excel-ready headers:
-      "Requirement ID", "Requirements", "Requirement (Yes/No)",
-      "Risk ID", "Risk to Health", "HA Risk Control",
-      "Verification ID", "Verification Method", "Acceptance Criteria"
 
-    Also includes snake_case aliases for backward compatibility.
-    """
     try:
         _load_model()
     except Exception as e:
@@ -192,7 +155,7 @@ def tm_predict(
         req_yesno = "Reference" if _is_header(rtxt) else "Requirement"
 
         if _is_header(rtxt):
-            rows.append({
+            row = {
                 "Requirement ID": rid or "NA",
                 "Requirements": rtxt,
                 "Requirement (Yes/No)": req_yesno,
@@ -202,27 +165,28 @@ def tm_predict(
                 "Verification ID": vid or "NA",
                 "Verification Method": "NA",
                 "Acceptance Criteria": "NA",
-                # aliases
                 "requirement_id": rid or "NA",
                 "requirements": rtxt,
-                "risk_ids": "NA",
-                "risks_to_health": "NA",
-                "ha_risk_controls": "NA",
                 "verification_id": vid or "NA",
                 "verification_method": "NA",
                 "acceptance_criteria": "NA",
-            })
+            }
+            rows.append(row)
             continue
 
         ha_slice = ha_by_req.get(rid, [])
-        risk_ids = _unique_join([str(h.get("risk_id") or h.get("Risk ID") or "") for h in ha_slice], default="TBD - Human / SME input")
-        risks_to_health = _unique_join([str(h.get("risk_to_health") or h.get("Risk to Health") or "") for h in ha_slice], default="TBD - Human / SME input")
-        risk_controls = _unique_join([str(h.get("risk_control") or h.get("HA Risk Control") or "") for h in ha_slice], default="TBD - Human / SME input")
+        risk_ids = _unique_join([str(h.get("risk_id") or h.get("Risk ID") or "") for h in ha_slice])
+        risks_to_health = _unique_join([str(h.get("risk_to_health") or h.get("Risk to Health") or "") for h in ha_slice])
+        risk_controls = _unique_join([str(h.get("risk_control") or h.get("HA Risk Control") or "") for h in ha_slice])
 
         drow = dvp_by_vid.get(vid) or dvp_by_req.get(rid)
-        vmethod = (str(drow.get("verification_method") or drow.get("Verification Method") or "") if drow else "").strip() or "TBD - Human / SME input"
-        vaccept = (str(drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "") if drow else "").strip() or "TBD - Human / SME input"
-        vid_eff = (str(drow.get("verification_id") or drow.get("Verification ID") or vid or "NA") if drow else (vid or "NA"))
+        vmethod = (str(drow.get("verification_method") or drow.get("Verification Method") or "").strip() if drow else "") or "TBD - Human / SME input"
+        vaccept = (str(drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "").strip() if drow else "") or "TBD - Human / SME input"
+        vid_eff = str(drow.get("verification_id") or drow.get("Verification ID") or vid or "NA") if drow else (vid or "NA")
+
+        # If risk control looks generic AND requirement keywords exist, try light tailoring (optional)
+        if "design controls" in risk_controls.lower() and _mapped(rtxt, risk_controls):
+            pass  # already overlaps; leave as-is
 
         rows.append({
             "Requirement ID": rid or "NA",
@@ -234,12 +198,8 @@ def tm_predict(
             "Verification ID": vid_eff,
             "Verification Method": vmethod,
             "Acceptance Criteria": vaccept,
-            # aliases
             "requirement_id": rid or "NA",
             "requirements": rtxt,
-            "risk_ids": risk_ids,
-            "risks_to_health": risks_to_health,
-            "ha_risk_controls": risk_controls,
             "verification_id": vid_eff,
             "verification_method": vmethod,
             "acceptance_criteria": vaccept,
