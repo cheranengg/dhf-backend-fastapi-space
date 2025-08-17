@@ -1,7 +1,6 @@
-# app/models/tm_infer.py
 from __future__ import annotations
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 # ================================
 # Environment / feature toggles
@@ -17,18 +16,15 @@ HF_TOKEN = (
     or None
 )
 
-# Prefer HF_HOME if present, else TRANSFORMERS_CACHE, else /tmp/hf
 CACHE_DIR = (
     os.getenv("HF_HOME")
     or os.getenv("TRANSFORMERS_CACHE")
     or "/tmp/hf"
 )
-
 OFFLOAD_DIR = os.getenv("OFFLOAD_DIR", "/tmp/offload")
 FORCE_CPU   = os.getenv("FORCE_CPU", "0") == "1"
 DEBUG_TM    = os.getenv("DEBUG_TM", "1") == "1"
 
-# Make sure the cache/offload dirs exist (avoid permission errors)
 try:
     os.makedirs(CACHE_DIR, exist_ok=True)
     os.makedirs(OFFLOAD_DIR, exist_ok=True)
@@ -44,16 +40,12 @@ def _token_cache_kwargs() -> Dict[str, Any]:
 
 # ================================
 # (Optional) Model loader
-#   We load the adapter to keep parity with HA/DVP.
-#   TM logic below is deterministic joins; the model
-#   can be used later for semantic scoring if desired.
 # ================================
 _tokenizer = None
 _model     = None
 _logged    = False
 
 def _try_peft_loader():
-    """Use project-specific PEFT loader if available; return (tok, model) or (None, None)."""
     try:
         from app.models._peft_loader import load_base_plus_adapter
         tok, mdl, device = load_base_plus_adapter(
@@ -71,7 +63,6 @@ def _try_peft_loader():
         return None, None
 
 def _load_model():
-    """Mirror dvp_infer loader pattern (adapter over base)."""
     global _tokenizer, _model, _logged
     if _tokenizer is not None and _model is not None:
         return
@@ -85,7 +76,7 @@ def _load_model():
             _logged = True
         return
 
-    # ---- Manual fallback load (4-bit if possible) ----
+    # fallback manual load (rarely used by TM)
     from transformers import AutoTokenizer, AutoModelForCausalLM
     import torch
     try:
@@ -151,6 +142,7 @@ def _unique_join(values: List[str], default: str = "NA") -> str:
 def _is_header(text: str) -> bool:
     return (text or "").strip().lower().endswith("requirements")
 
+
 # ================================
 # Public API
 # ================================
@@ -160,27 +152,19 @@ def tm_predict(
     dvp_rows: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    Build the Trace Matrix by combining:
-      - Product Requirements
-      - Hazard Analysis rows (by Requirement ID)
-      - DVP rows (by Verification ID, fallback by Requirement ID)
-
     Returns rows with canonical, Excel-ready headers:
       "Requirement ID", "Requirements", "Requirement (Yes/No)",
       "Risk ID", "Risk to Health", "HA Risk Control",
       "Verification ID", "Verification Method", "Acceptance Criteria"
 
-    Also includes snake_case aliases for backward compatibility:
-      risk_ids, risks_to_health, ha_risk_controls, verification_method, acceptance_criteria
+    Also includes snake_case aliases for backward compatibility.
     """
-    # Load adapter (optional; keeps parity with HA/DVP)
     try:
         _load_model()
     except Exception as e:
         if DEBUG_TM:
             print(f"[tm] model load non-fatal: {e}")
 
-    # Index HA by Requirement ID
     from collections import defaultdict
     ha_by_req: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for h in ha_rows or []:
@@ -188,7 +172,6 @@ def tm_predict(
         if rid:
             ha_by_req[rid].append(h)
 
-    # Index DVP by Verification ID and also by Requirement ID (fallback)
     dvp_by_vid: Dict[str, Dict[str, Any]] = {}
     dvp_by_req: Dict[str, Dict[str, Any]] = {}
     for d in dvp_rows or []:
@@ -206,12 +189,10 @@ def tm_predict(
         vid = str(r.get("Verification ID") or r.get("verification_id") or "").strip()
         rtxt = str(r.get("Requirements") or r.get("requirements") or "").strip()
 
-        # Decide "Requirement (Yes/No)" column
         req_yesno = "Reference" if _is_header(rtxt) else "Requirement"
 
         if _is_header(rtxt):
-            # Header rows: NA for analysis/verification fields
-            row = {
+            rows.append({
                 "Requirement ID": rid or "NA",
                 "Requirements": rtxt,
                 "Requirement (Yes/No)": req_yesno,
@@ -221,37 +202,29 @@ def tm_predict(
                 "Verification ID": vid or "NA",
                 "Verification Method": "NA",
                 "Acceptance Criteria": "NA",
-                # aliases for backward compatibility
+                # aliases
+                "requirement_id": rid or "NA",
+                "requirements": rtxt,
                 "risk_ids": "NA",
                 "risks_to_health": "NA",
                 "ha_risk_controls": "NA",
                 "verification_id": vid or "NA",
                 "verification_method": "NA",
                 "acceptance_criteria": "NA",
-                "requirement_id": rid or "NA",
-                "requirements": rtxt,
-            }
-            rows.append(row)
+            })
             continue
 
-        # ---- Non-header rows ----
         ha_slice = ha_by_req.get(rid, [])
         risk_ids = _unique_join([str(h.get("risk_id") or h.get("Risk ID") or "") for h in ha_slice], default="TBD - Human / SME input")
         risks_to_health = _unique_join([str(h.get("risk_to_health") or h.get("Risk to Health") or "") for h in ha_slice], default="TBD - Human / SME input")
         risk_controls = _unique_join([str(h.get("risk_control") or h.get("HA Risk Control") or "") for h in ha_slice], default="TBD - Human / SME input")
 
-        drow = dvp_by_vid.get(vid)
-        if not drow:
-            drow = dvp_by_req.get(rid)  # fallback if VID missing
+        drow = dvp_by_vid.get(vid) or dvp_by_req.get(rid)
+        vmethod = (str(drow.get("verification_method") or drow.get("Verification Method") or "") if drow else "").strip() or "TBD - Human / SME input"
+        vaccept = (str(drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "") if drow else "").strip() or "TBD - Human / SME input"
+        vid_eff = (str(drow.get("verification_id") or drow.get("Verification ID") or vid or "NA") if drow else (vid or "NA"))
 
-        vmethod = str(drow.get("verification_method") or drow.get("Verification Method") or "").strip() if drow else ""
-        vaccept = str(drow.get("acceptance_criteria") or drow.get("Acceptance Criteria") or "").strip() if drow else ""
-        vmethod = vmethod if vmethod else "TBD - Human / SME input"
-        vaccept = vaccept if vaccept else "TBD - Human / SME input"
-        vid_eff = str(drow.get("verification_id") or drow.get("Verification ID") or vid or "NA") if drow else (vid or "NA")
-
-        row = {
-            # Canonical, Excel-ready names (match your template order)
+        rows.append({
             "Requirement ID": rid or "NA",
             "Requirements": rtxt,
             "Requirement (Yes/No)": req_yesno,
@@ -261,7 +234,7 @@ def tm_predict(
             "Verification ID": vid_eff,
             "Verification Method": vmethod,
             "Acceptance Criteria": vaccept,
-            # Aliases (snake_case) so older UI code won't break
+            # aliases
             "requirement_id": rid or "NA",
             "requirements": rtxt,
             "risk_ids": risk_ids,
@@ -270,7 +243,6 @@ def tm_predict(
             "verification_id": vid_eff,
             "verification_method": vmethod,
             "acceptance_criteria": vaccept,
-        }
-        rows.append(row)
+        })
 
     return rows
