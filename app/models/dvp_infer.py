@@ -1,4 +1,3 @@
-# app/models/dvp_infer.py
 from __future__ import annotations
 import os, re, json
 from typing import List, Dict, Any, Optional, Tuple
@@ -372,7 +371,6 @@ def _clean_bullets(s: str) -> str:
     lines: List[str] = []
     for line in (s or "").splitlines():
         ln = line.strip().lstrip("-• ").strip()
-        # allow slightly shorter lines; still avoid junk
         if len(ln.split()) >= 3:
             lines.append(f"- {ln}")
         if len(lines) == 4:
@@ -381,20 +379,16 @@ def _clean_bullets(s: str) -> str:
 
 
 def _numbers_from_req(req: str) -> List[str]:
-    # capture "1 second", "30 s", "±5%", "100 µA", "1.2 m", etc.
     unit_pat = r"(mA|µA|A|V|kV|ms|s|min|h|mL/h|mL|L|kPa|Pa|%|dB|Ω|ohm|°C|g|kg|N|cycles|cm|mm|µL|m)"
     hits = re.findall(rf"[±]?\d+(?:\.\d+)?\s?(?:{unit_pat})", req, flags=re.IGNORECASE)
-    # normalize “within 1 second” to “1 s” if not already captured
     if re.search(r"\bwithin\s+1\s+second\b", req, flags=re.IGNORECASE):
         if not any(h.lower().endswith(" s") or h.lower().endswith("s") for h in hits):
             hits.append("1 s")
-    # normalize common variants
     norm: List[str] = []
     for h in hits:
         hh = h.replace("seconds", "s").replace("second", "s").replace("sec", "s")
         hh = hh.replace("ohm", "Ω").replace("uA", "µA").replace("uL", "µL")
         norm.append(hh)
-    # de-dup preserving order
     out: List[str] = []
     for x in norm:
         if x not in out:
@@ -405,12 +399,10 @@ def _numbers_from_req(req: str) -> List[str]:
 def _rewrite_acceptance(req: str, bullets: str, template: Optional[str]) -> str:
     nums = _numbers_from_req(req)
     if nums:
-        # echo 1–3 key numeric specs from requirement text
         joined = ", ".join(nums[:3])
         return f"System shall comply with the stated requirement under the defined test conditions, meeting {joined}."
     if template and isinstance(template, str) and template.strip():
         return template.strip()
-    # last resort: compress the requirement
     req_short = re.sub(r"\s+", " ", req.strip())
     return f"System shall meet the requirement: {req_short}"
 
@@ -428,7 +420,6 @@ def _compose_ctx(req_text: str) -> Tuple[str, Optional[str]]:
             tmpl = h.get("acceptance_template")
         if len(bullets) >= 6:
             break
-    # fallback to heuristic specs if KB empty
     if not bullets:
         for spec in list(_TEST_SPEC_MAP.values())[:3]:
             bullets.append(f"- {spec}")
@@ -442,7 +433,6 @@ def _gen_test_block(req: str) -> Dict[str, str]:
     ctx, tmpl = _compose_ctx(req)
 
     if _model is None or _tokenizer is None:
-        # fallback when model not available
         fb = [
             "- Test at 3 setpoints; record measured vs setpoint",
             "- Repeatability across 3 cycles; compute deviation",
@@ -457,7 +447,6 @@ def _gen_test_block(req: str) -> Dict[str, str]:
 
     prompt = _PROMPT.format(req=req, ctx=ctx or "(no context)")
     enc = _tokenizer(prompt, return_tensors="pt", truncation=True, max_length=INPUT_MAX, padding=True)
-    # move to model device
     try:
         dev = next(_model.parameters()).device  # type: ignore
         enc = {k: v.to(dev) for k, v in enc.items()}
@@ -478,7 +467,6 @@ def _gen_test_block(req: str) -> Dict[str, str]:
 
     decoded = _tokenizer.decode(out[0], skip_special_tokens=True)
 
-    # Extract trailing JSON block
     def _balanced_json(text: str) -> Optional[str]:
         depth, start = 0, -1
         for i, ch in enumerate(text):
@@ -500,8 +488,6 @@ def _gen_test_block(req: str) -> Dict[str, str]:
         obj = {}
 
     bullets = _clean_bullets(obj.get("Test Procedure", ""))
-
-    # If model didn't yield enough steps, synthesize from KB context so UI never sees "TBD"
     if bullets == "TBD":
         kb_lines = [ln.strip() for ln in (ctx or "").splitlines() if ln.strip().startswith("- ")]
         if kb_lines:
@@ -529,15 +515,13 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha_rows: List[Dict[str, Any]
       - "Verification ID" (or "verification_id") optional
       - "Requirements"   (text)
 
-    Returns rows with:
+    Returns rows with **snake_case keys**:
       - verification_id, requirement_id, requirements
       - verification_method, sample_size, test_procedure, acceptance_criteria
     """
     _load_model()
 
     rows: List[Dict[str, Any]] = []
-
-    # precompute running IDs for rows missing a VID
     missing_idx = 1
 
     for r in requirements or []:
@@ -545,14 +529,9 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha_rows: List[Dict[str, Any]
         vid_in = str(r.get("Verification ID") or r.get("verification_id") or "").strip()
         rtxt = str(r.get("Requirements") or r.get("requirements") or "").strip()
 
-        # Section headers: keep as non-actionable, but still assign a running DV-ID
-        _is_header = rtxt.strip().lower().endswith("requirements")
-        if _is_header:
-            if not vid_in:
-                vid = f"DV-{missing_idx:03d}"
-                missing_idx += 1
-            else:
-                vid = vid_in
+        # Section headers (e.g., "... Requirements")
+        if rtxt.strip().lower().endswith("requirements"):
+            vid = vid_in or f"DV-{missing_idx:03d}"; missing_idx += 1 if not vid_in else 0
             rows.append({
                 "verification_id": vid,
                 "requirement_id": rid,
@@ -564,16 +543,9 @@ def dvp_predict(requirements: List[Dict[str, Any]], ha_rows: List[Dict[str, Any]
             })
             continue
 
-        # Generate running VID if missing
-        if vid_in:
-            vid = vid_in
-        else:
-            vid = f"DV-{missing_idx:03d}"
-            missing_idx += 1
+        vid = vid_in or f"DV-{missing_idx:03d}"; missing_idx += 1 if not vid_in else 0
 
         block = _gen_test_block(rtxt)
-
-        # Override with deterministic method & sample from HA
         method = _verification_method(rtxt)
         sample = _sample_size(rid, ha_rows or [])
 
